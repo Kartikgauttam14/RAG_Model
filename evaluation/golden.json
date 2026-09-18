@@ -1,0 +1,16 @@
+[
+  {
+    "id": "delivery-supported",
+    "question": "How long does delivery take?",
+    "required_sources": ["Mansam_SSOT_Master_v3_6.xlsx"],
+    "allowed_sources": ["Mansam_SSOT_Master_v3_6.xlsx"],
+    "must_not_claim": ["same-day delivery"]
+  },
+  {
+    "id": "unknown-policy",
+    "question": "What is the policy for an unlisted country?",
+    "required_sources": [],
+    "allowed_sources": [],
+    "must_not_claim": ["a specific shipping time"]
+  }
+]

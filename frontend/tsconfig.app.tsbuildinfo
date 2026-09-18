@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/audio/userecorder.ts","./src/components/audiocontrols.tsx","./src/components/sources.tsx","./src/pages/adminpage.tsx","./src/pages/chatpage.tsx","./src/services/api.ts","./tests/sources.test.tsx","./tests/setup.ts"],"version":"5.8.2"}

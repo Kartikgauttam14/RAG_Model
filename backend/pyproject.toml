@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mansam-rag-backend"
+version = "0.1.0"
+description = "Evidence-first RAG, memory, and voice API"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "alembic==1.15.2",
+  "argon2-cffi==23.1.0",
+  "asyncpg==0.30.0",
+  "beautifulsoup4==4.13.3",
+  "celery==5.5.0",
+  "email-validator==2.2.0",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "openpyxl==3.1.5",
+  "orjson==3.11.6",
+  "pgvector==0.4.0",
+  "prometheus-client==0.21.1",
+  "pydantic==2.11.3",
+  "pydantic-settings==2.8.1",
+  "PyJWT==2.13.0",
+  "pypdf==6.19.0",
+  "python-docx==1.1.2",
+  "python-multipart==0.0.31",
+  "redis==5.2.1",
+  "SQLAlchemy==2.0.40",
+  "starlette==1.6.0",
+  "structlog==25.2.0",
+  "tenacity==9.0.0",
+  "uvicorn[standard]==0.34.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "bandit==1.8.3",
+  "coverage==7.8.0",
+  "mypy==1.15.0",
+  "pip-audit==2.8.0",
+  "pytest==9.0.3",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==6.1.1",
+  "respx==0.22.0",
+  "ruff==0.11.5",
+  "types-openpyxl==3.1.5.20250306",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+  "integration: requires local infrastructure",
+  "e2e: end-to-end scenarios",
+  "security: security-focused tests",
+  "evaluation: RAG evaluation suite",
+  "live: requires configured external providers",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "RUF"]
+ignore = ["S101", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/api/routes/auth.py" = ["S105"]
+"app/config/settings.py" = ["S105"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+exclude = ["migrations"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["celery", "celery.*", "pgvector", "pgvector.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
