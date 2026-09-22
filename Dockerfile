@@ -34,4 +34,7 @@ COPY scripts ./scripts
 RUN mkdir -p /app/uploads && chown -R app:app /app
 USER app
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+# Manual Render Docker services do not support pre-deploy commands on the free plan.
+# Apply the idempotent Alembic migrations before accepting traffic so a newly
+# provisioned Render Postgres database has the required schema.
+CMD ["sh", "-c", "alembic -c alembic.ini upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"]
