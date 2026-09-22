@@ -1,16 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import { getAdminMetrics, listDocuments, uploadDocument } from "../services/api";
 
-export function AdminPage({ token }: { token: string }) {
+export function AdminPage() {
   const [documents, setDocuments] = useState<Array<{ id: string; name: string; status: string; current_version: number; created_at: string }>>([]);
   const [metrics, setMetrics] = useState<Record<string, number>>({});
   const [status, setStatus] = useState("");
 
   const refresh = useCallback(async () => {
-    const [docs, values] = await Promise.all([listDocuments(token), getAdminMetrics(token)]);
+    const [docs, values] = await Promise.all([listDocuments(), getAdminMetrics()]);
     setDocuments(docs);
     setMetrics(values);
-  }, [token]);
+  }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -18,7 +18,7 @@ export function AdminPage({ token }: { token: string }) {
     if (!file) return;
     setStatus("Uploading…");
     try {
-      await uploadDocument(token, file);
+      await uploadDocument(file);
       setStatus("Queued for indexing");
       await refresh();
     } catch (reason) {
@@ -43,4 +43,3 @@ export function AdminPage({ token }: { token: string }) {
     </main>
   );
 }
-

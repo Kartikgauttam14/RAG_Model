@@ -13,6 +13,9 @@ from app.database import get_db
 from app.database.models import Role, User
 
 bearer = HTTPBearer(auto_error=False)
+PUBLIC_USER_EMAIL = "public@mansam.local"
+# This value is never used for authentication; the synthetic public account has no password.
+PUBLIC_PASSWORD_HASH = "authentication-disabled"  # noqa: S105
 
 
 @dataclass(frozen=True)
@@ -28,10 +31,20 @@ async def get_current_principal(
     db: AsyncSession = Depends(get_db),
 ) -> Principal:
     if not settings.authentication_enabled:
-        user = await db.scalar(select(User).where(User.deleted_at.is_(None)).order_by(User.created_at).limit(1))
-        if user:
-            return Principal(user.id, Role.admin, user.tenant_id)
-        return Principal(uuid.UUID(int=0), Role.admin, "default")
+        # Public mode deliberately gives every request one shared principal.  Persist it
+        # so conversations, feedback, retrieval events, and uploaded documents keep
+        # valid user foreign keys even on a freshly provisioned database.
+        user = await db.scalar(select(User).where(User.email == PUBLIC_USER_EMAIL))
+        if user is None:
+            user = User(
+                email=PUBLIC_USER_EMAIL,
+                password_hash=PUBLIC_PASSWORD_HASH,
+                role=Role.admin,
+                tenant_id="default",
+            )
+            db.add(user)
+            await db.flush()
+        return Principal(user.id, Role.admin, user.tenant_id)
     if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     try:

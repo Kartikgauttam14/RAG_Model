@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { synthesize } from "../services/api";
 
-export function AudioControls({ token, text, language }: { token: string; text: string; language: string }) {
+export function AudioControls({ text, language }: { text: string; language: string }) {
   const audio = useRef<HTMLAudioElement | null>(null);
   const [state, setState] = useState<"idle" | "loading" | "ready" | "playing" | "error">("idle");
   const [muted, setMuted] = useState(false);
@@ -13,7 +13,7 @@ export function AudioControls({ token, text, language }: { token: string; text: 
   async function loadAndPlay() {
     try {
       setState("loading");
-      const blob = await synthesize(token, text, language);
+      const blob = await synthesize(text, language);
       if (audio.current?.src) URL.revokeObjectURL(audio.current.src);
       audio.current = new Audio(URL.createObjectURL(blob));
       audio.current.muted = muted;
@@ -61,4 +61,3 @@ export function AudioControls({ token, text, language }: { token: string; text: 
     </div>
   );
 }
-

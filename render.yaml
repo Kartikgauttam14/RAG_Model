@@ -55,9 +55,8 @@ services:
     envVars:
       - key: APP_ENV
         value: production
-      # Required by app/config/settings.py::validate_runtime outside development.
       - key: AUTHENTICATION_ENABLED
-        value: "true"
+        value: "false"
       - key: APP_NAME
         value: Mansam RAG
       - key: API_PREFIX
@@ -234,7 +233,7 @@ services:
       - key: VITE_API_BASE_URL
         sync: false
       - key: VITE_AUTH_ENABLED
-        value: "true"
+        value: "false"
 
   # ------------------------------------------------------------------------ Key Value
   - type: keyvalue

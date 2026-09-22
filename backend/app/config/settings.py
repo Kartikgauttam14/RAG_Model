@@ -172,8 +172,6 @@ class Settings(BaseSettings):
         return value
 
     def validate_runtime(self) -> None:
-        if self.app_env in {"staging", "production"} and not self.authentication_enabled:
-            raise RuntimeError("AUTHENTICATION_ENABLED must be true outside development")
         if self.app_env in {"staging", "production"}:
             required = {
                 "HF_INFERENCE_URL": self.hf_inference_url,

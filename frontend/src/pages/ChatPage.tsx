@@ -20,7 +20,7 @@ const PROGRESS: Record<string, string> = {
 
 const ARABIC = /[\u0600-\u06ff]/;
 
-export function ChatPage({ token }: { token: string }) {
+export function ChatPage() {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [conversationId, setConversationId] = useState<string>();
@@ -51,7 +51,7 @@ export function ChatPage({ token }: { token: string }) {
     setState(PROGRESS.processing);
     setError("");
     try {
-      const answer = await streamChat(token, clean, conversationId, (stage) =>
+      const answer = await streamChat(clean, conversationId, (stage) =>
         setState(PROGRESS[stage] ?? stage),
       );
       setConversationId(answer.conversation_id);
@@ -77,7 +77,7 @@ export function ChatPage({ token }: { token: string }) {
       }
       setState("transcribing");
       const audio = await recorder.stop();
-      const result = await transcribe(token, audio);
+      const result = await transcribe(audio);
       setInput(result.transcript);
       setState(result.status === "needs_confirmation" ? "confirm transcript before sending" : "ready");
     } catch {
@@ -100,13 +100,12 @@ export function ChatPage({ token }: { token: string }) {
                 {message.answer.conflicts.length > 0 && <aside className="conflict">Sources disagree: {message.answer.conflicts.join(" ")}</aside>}
                 <Sources citations={message.answer.citations} />
                 <AudioControls
-                  token={token}
                   text={message.answer.answer}
                   language={ARABIC.test(message.answer.answer) ? "ar" : "en"}
                 />
                 <div className="feedback">
-                  <button onClick={() => void submitFeedback(token, message.answer!.message_id, "helpful")}>Helpful</button>
-                  <button onClick={() => void submitFeedback(token, message.answer!.message_id, "incorrect")}>Incorrect</button>
+                  <button onClick={() => void submitFeedback(message.answer!.message_id, "helpful")}>Helpful</button>
+                  <button onClick={() => void submitFeedback(message.answer!.message_id, "incorrect")}>Incorrect</button>
                   <button onClick={() => navigator.clipboard.writeText(message.text)}>Copy</button>
                   <button disabled={busy} onClick={() => void ask(messages[index - 1]?.text ?? "")}>Regenerate</button>
                 </div>
