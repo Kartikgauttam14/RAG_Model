@@ -40,6 +40,22 @@ app.include_router(health_router)
 app.include_router(api_router, prefix=settings.api_prefix)
 
 
+@app.get("/", include_in_schema=False)
+async def root() -> dict[str, str]:
+    """Landing page for the bare service URL.
+
+    The UI is a separate static site; browsers hitting the API root otherwise
+    get FastAPI's default `{"detail": "Not Found"}`. Point at the real
+    entry points instead.
+    """
+    return {
+        "service": settings.app_name,
+        "docs": f"{settings.api_prefix}/docs",
+        "health": "/health/live",
+        "ready": "/health/ready",
+    }
+
+
 @app.on_event("startup")
 async def validate_configuration() -> None:
     settings.validate_runtime()
