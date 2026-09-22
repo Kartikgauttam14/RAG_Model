@@ -74,10 +74,10 @@ services:
           type: web
           envVarKey: RENDER_EXTERNAL_URL
       # Must be the exact browser origin of the UI, scheme included, no trailing slash.
-      # After the first deploy, confirm the static site's real URL and update this value
-      # (and add any custom domain to it) if Render had to disambiguate the name.
+      # Keep this exact value in sync with the actual deployed static-site URL.
+      # Add any custom domain as a second comma-separated origin if it stays reachable.
       - key: FRONTEND_ORIGINS
-        value: https://mansam-ui.onrender.com
+        value: https://mansam-ui-static.onrender.com
 
       # Render's internal Postgres URL is `postgresql://...`; SQLAlchemy needs the asyncpg
       # driver in the scheme, so paste it as `postgresql+asyncpg://...` (see the doc).
