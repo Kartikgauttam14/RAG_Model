@@ -4,10 +4,13 @@ from app.speech.huggingface import (
     HuggingFaceTTSProvider,
     SpeechProviderUnavailableError,
 )
+from app.speech.openai_compatible import OpenAICompatibleSTTProvider, OpenAICompatibleTTSProvider
 
 __all__ = [
     "HuggingFaceSTTProvider",
     "HuggingFaceTTSProvider",
+    "OpenAICompatibleSTTProvider",
+    "OpenAICompatibleTTSProvider",
     "SpeechProviderUnavailableError",
     "SpeechToTextProvider",
     "SynthesizedAudio",

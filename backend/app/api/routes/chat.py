@@ -15,11 +15,13 @@ from app.dependencies import get_embeddings, get_llm, get_prompts, get_redis, ge
 from app.embeddings import EmbeddingProvider
 from app.llm import LLMProvider, LLMUnavailableError
 from app.memory import MemoryService
+from app.monitoring.logging import get_logger
 from app.rag.prompts import PromptRepository
 from app.reranking import Reranker
 from app.retrieval import HybridRetriever
 
 router = APIRouter(tags=["chat"])
+logger = get_logger(__name__)
 
 
 def _service(
@@ -36,6 +38,7 @@ def _service(
         settings.rag_vector_top_k,
         settings.rag_lexical_top_k,
         settings.rerank_top_k,
+        lexical_config=settings.lexical_text_search_config,
     )
     memory = MemoryService(redis, embeddings, llm, prompts, settings)
     return ChatService(llm=llm, retriever=retriever, memory=memory, prompts=prompts, settings=settings)
@@ -89,6 +92,11 @@ async def chat_stream(
                 response = await service.respond(db, principal, payload, request_id, progress)
                 await queue.put({"type": "answer", "data": response.model_dump(mode="json")})
             except Exception as exc:
+                logger.exception(
+                    "chat_stream_failed",
+                    request_id=request_id,
+                    error_type=type(exc).__name__,
+                )
                 await queue.put(
                     {
                         "type": "error",

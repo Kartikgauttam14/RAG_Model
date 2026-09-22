@@ -48,12 +48,11 @@ class StructureAwareChunker:
                     metadata=metadata,
                 )
             )
-            overlap = self._tail(content, self.overlap_chars)
+            carried_text, carried_meta = self._overlap(buffer, buffer_meta)
             buffer.clear()
             buffer_meta.clear()
-            if overlap:
-                buffer.append(overlap)
-                buffer_meta.append(first)
+            buffer.extend(carried_text)
+            buffer_meta.extend(carried_meta)
 
         for element in document.elements:
             if element.kind == "heading":
@@ -108,6 +107,34 @@ class StructureAwareChunker:
             section=element.section,
             metadata=element.metadata,
         )
+
+    def _overlap(
+        self,
+        buffer: list[str],
+        buffer_meta: list[ExtractedElement],
+    ) -> tuple[list[str], list[ExtractedElement]]:
+        """Choose the tail carried into the next chunk, aligned with its source elements.
+
+        Structured records (spreadsheet rows, table rows) are repeated whole instead of
+        being sliced by characters, so a chunk never starts with a fragment such as
+        ``of Arabia\nMall / Address: ...`` that hides which record it belongs to.
+        """
+        if self.overlap_chars <= 0:
+            return [], []
+        if all(element.kind == "table" for element in buffer_meta):
+            carried_text: list[str] = []
+            carried_meta: list[ExtractedElement] = []
+            for text, element in zip(reversed(buffer), reversed(buffer_meta), strict=True):
+                candidate = "\n\n".join([text, *carried_text])
+                if carried_text and len(candidate) > self.overlap_chars:
+                    break
+                carried_text.insert(0, text)
+                carried_meta.insert(0, element)
+            return carried_text, carried_meta
+        tail = self._tail(normalize_text("\n\n".join(buffer)), self.overlap_chars)
+        if not tail:
+            return [], []
+        return [tail], [buffer_meta[0]]
 
     @staticmethod
     def _tail(text: str, size: int) -> str:

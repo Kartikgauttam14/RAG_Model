@@ -1,13 +1,16 @@
+import asyncio
 import hashlib
 import time
+import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import Principal
-from app.chat.query import QueryPlanner
+from app.chat.query import QueryPlan, QueryPlanner
 from app.chat.schemas import ChatRequest, ChatResponse, CitationResponse
 from app.config import Settings
 from app.database.models import (
@@ -17,12 +20,13 @@ from app.database.models import (
     MessageRole,
     RetrievalEvent,
 )
+from app.database.session import SessionFactory
 from app.llm import LLMProvider, LLMUnavailableError
 from app.memory import MemoryService
 from app.monitoring.logging import get_logger
 from app.rag.prompts import PromptRepository
-from app.retrieval import HybridRetriever
-from app.verification import GroundedAnswerService
+from app.retrieval import HybridRetriever, RetrievalResult
+from app.verification import GroundedAnswer, GroundedAnswerService
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 logger = get_logger(__name__)
@@ -41,13 +45,19 @@ class ChatService:
         self.llm = llm
         self.retriever = retriever
         self.memory = memory
-        self.planner = QueryPlanner(llm, prompts)
+        self.prompts = prompts
+        self.settings = settings
+        self._background: set[asyncio.Task[None]] = set()
+        self.planner = QueryPlanner(llm, prompts, settings.planner_llm_min_words, settings.llm_fast_model)
         self.answerer = GroundedAnswerService(
             llm,
             prompts,
             settings.rag_min_score,
             settings.rag_min_evidence,
             settings.rag_max_context_chars,
+            draft_model=settings.llm_draft_model,
+            fast_model=settings.llm_fast_model,
+            verify_enabled=settings.rag_verify_enabled,
         )
 
     async def respond(
@@ -102,59 +112,73 @@ class ChatService:
             return response
 
         await emit("retrieving")
-        retrieval = await self.retriever.retrieve(
-            db,
-            query=plan.normalized_query,
-            tenant_id=principal.tenant_id,
-            user_id=principal.user_id,
-            role=principal.role.value,
-            filters=plan.filters,
-        )
-        if not retrieval.evidence and plan.filters:
+        used_filters = plan.filters
+        retrieval = await self._retrieve(db, principal, plan, filters=used_filters)
+        if not retrieval.evidence and used_filters:
             # Planner filters (e.g. language) can zero out retrieval; retry
             # unfiltered so the question can still be answered from the corpus.
             logger.info("retrieval_retry_without_filters", request_id=request_id)
-            retrieval = await self.retriever.retrieve(
-                db,
-                query=plan.normalized_query,
-                tenant_id=principal.tenant_id,
-                user_id=principal.user_id,
-                role=principal.role.value,
-                filters={},
-            )
+            used_filters = {}
+            retrieval = await self._retrieve(db, principal, plan, filters=used_filters)
         await emit("reranking")
-        retrieval_event = RetrievalEvent(
-            request_id=request_id,
-            user_id=principal.user_id,
-            conversation_id=conversation.id,
-            query_hash=hashlib.sha256(plan.normalized_query.encode()).hexdigest(),
-            filters=plan.filters,
-            candidate_chunk_ids=[str(item) for item in retrieval.candidate_chunk_ids],
-            selected_chunk_ids=[str(item.chunk_id) for item in retrieval.evidence],
-            scores={
-                str(item.chunk_id): {
-                    "vector": item.vector_score,
-                    "lexical": item.lexical_score,
-                    "fused": item.fused_score,
-                    "reranker": item.reranker_score,
-                }
-                for item in retrieval.evidence
-            },
-            latency_ms=retrieval.latency_ms,
-        )
-        db.add(retrieval_event)
         await emit("generating")
-        try:
-            answer = await self.answerer.answer(
-                question=request.message,
-                language=plan.language,
-                evidence=retrieval.evidence,
+        answer = await self._answer(db, request.message, plan.language, retrieval, request_id)
+        if not answer.grounded and plan.planned_by == "deterministic":
+            # The cheap plan sends a short message to the retriever verbatim, which is
+            # enough for "price of Mamlakati" but not for a greeting like "hi", where the
+            # model's rewrite is what reaches the greeting sheet. Escalate to the planner
+            # once before falling back to a refusal.
+            logger.info("planner_escalated", request_id=request_id)
+            await emit("understanding")
+            escalated = await self.planner.plan(request.message, history, force_llm=True)
+            if escalated.planned_by == "llm":
+                await emit("retrieving")
+                escalated_filters = escalated.filters
+                escalated_retrieval = await self._retrieve(db, principal, escalated, filters=escalated_filters)
+                if not escalated_retrieval.evidence and escalated_filters:
+                    escalated_filters = {}
+                    escalated_retrieval = await self._retrieve(
+                        db, principal, escalated, filters=escalated_filters
+                    )
+                await emit("reranking")
+                await emit("generating")
+                escalated_answer = await self._answer(
+                    db, request.message, escalated.language, escalated_retrieval, request_id
+                )
+                if escalated_answer.grounded or escalated_answer.confidence > answer.confidence:
+                    plan = escalated
+                    used_filters = escalated_filters
+                    retrieval = escalated_retrieval
+                    answer = escalated_answer
+        if used_filters and not answer.grounded:
+            # Retrieval can rank an on-topic-looking but fact-free chunk above
+            # the chunk that actually holds the answer (e.g. an Arabic question
+            # whose fact only exists in an English settings sheet). Planner
+            # filters such as `language` hide that chunk, so widen once,
+            # unfiltered, and keep whichever answer the verifier trusts more.
+            logger.info("retrieval_widened_retry", request_id=request_id)
+            await emit("retrieving")
+            widened = await self._retrieve(db, principal, plan, filters={})
+            await emit("reranking")
+            await emit("generating")
+            widened_answer = await self._answer(
+                db, request.message, plan.language, widened, request_id
             )
-        except LLMUnavailableError:
-            logger.warning("llm_unavailable", request_id=request_id)
-            await db.rollback()
-            raise
+            if widened_answer.grounded or widened_answer.confidence > answer.confidence:
+                used_filters = {}
+                retrieval = widened
+                answer = widened_answer
         await emit("verifying")
+        db.add(
+            self._retrieval_event(
+                request_id=request_id,
+                principal=principal,
+                conversation=conversation,
+                plan=plan,
+                retrieval=retrieval,
+                filters=used_filters,
+            )
+        )
         response = await self._persist_answer(
             db,
             conversation,
@@ -179,14 +203,17 @@ class ChatService:
             )
         )
         await self.memory.append_short_term(conversation.id, "assistant", answer.answer)
-        await self.memory.extract_and_store(
-            db,
-            user_id=principal.user_id,
-            tenant_id=principal.tenant_id,
-            source_message_id=user_message.id,
-            text=request.message,
-        )
+        if self.settings.long_term_memory_inline:
+            await self.memory.extract_and_store(
+                db,
+                user_id=principal.user_id,
+                tenant_id=principal.tenant_id,
+                source_message_id=user_message.id,
+                text=request.message,
+            )
         await db.commit()
+        if not self.settings.long_term_memory_inline:
+            self._schedule_memory_extraction(user_message.id, principal, request.message)
         logger.info(
             "chat_completed",
             request_id=request_id,
@@ -199,6 +226,117 @@ class ChatService:
         )
         await emit("complete")
         return response
+
+    def _schedule_memory_extraction(self, message_id: uuid.UUID, principal: Principal, text: str) -> None:
+        """Remember a message without holding the answer behind it.
+
+        Extraction costs one generation plus one embedding call, and the caller only
+        needs the answer. The task opens its own session because the request's session
+        is closed once the response is sent, and a failure here must never cost the
+        user an answer.
+        """
+        if not self.settings.long_term_memory_enabled:
+            return
+        task = asyncio.create_task(self._extract_memory(message_id, principal, text))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _extract_memory(self, message_id: uuid.UUID, principal: Principal, text: str) -> None:
+        try:
+            async with SessionFactory() as db:
+                await self.memory.extract_and_store(
+                    db,
+                    user_id=principal.user_id,
+                    tenant_id=principal.tenant_id,
+                    source_message_id=message_id,
+                    text=text,
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning("memory_extraction_failed", message_id=str(message_id), error=str(exc))
+
+    async def _retrieve(
+        self,
+        db: AsyncSession,
+        principal: Principal,
+        plan: QueryPlan,
+        *,
+        filters: dict[str, Any],
+    ) -> RetrievalResult:
+        result = await self.retriever.retrieve(
+            db,
+            query=plan.normalized_query,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            role=principal.role.value,
+            filters=filters,
+        )
+        counts = await self.retriever.count_evidence(
+            db,
+            query=plan.normalized_query,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            role=principal.role.value,
+        )
+        if not counts:
+            return result
+        # A recorded count outranks retrieved rows, so it goes first: the model quotes the
+        # number instead of tallying evidence, and the citation resolves to the row it used.
+        known = {item.chunk_id for item in result.evidence}
+        additions = [item for item in counts if item.chunk_id not in known]
+        if not additions:
+            return result
+        return replace(result, evidence=[*additions, *result.evidence])
+
+    async def _answer(
+        self,
+        db: AsyncSession,
+        question: str,
+        language: str,
+        retrieval: RetrievalResult,
+        request_id: str,
+    ) -> GroundedAnswer:
+        try:
+            return await self.answerer.answer(
+                question=question,
+                language=language,
+                evidence=retrieval.evidence,
+            )
+        except LLMUnavailableError:
+            logger.warning("llm_unavailable", request_id=request_id)
+            await db.rollback()
+            raise
+
+    @staticmethod
+    def _retrieval_event(
+        *,
+        request_id: str,
+        principal: Principal,
+        conversation: Conversation,
+        plan: QueryPlan,
+        retrieval: RetrievalResult,
+        filters: dict[str, Any],
+    ) -> RetrievalEvent:
+        return RetrievalEvent(
+            request_id=request_id,
+            user_id=principal.user_id,
+            conversation_id=conversation.id,
+            query_hash=hashlib.sha256(plan.normalized_query.encode()).hexdigest(),
+            filters=filters,
+            candidate_chunk_ids=[str(item) for item in retrieval.candidate_chunk_ids],
+            selected_chunk_ids=[str(item.chunk_id) for item in retrieval.evidence],
+            scores={
+                str(item.chunk_id): {
+                    "vector": item.vector_score,
+                    "lexical": item.lexical_score,
+                    "fused": item.fused_score,
+                    "reranker": item.reranker_score,
+                }
+                for item in retrieval.evidence
+            },
+            latency_ms=retrieval.latency_ms,
+        )
+
 
     @staticmethod
     async def _conversation(db: AsyncSession, principal: Principal, request: ChatRequest) -> Conversation:

@@ -3,6 +3,11 @@ import httpx
 from app.config import Settings
 from app.speech.base import SynthesizedAudio, Transcript
 
+# Speech calls are long running, so the timeout is applied per request as well as
+# on the internally created client (a client supplied by dependency injection does
+# not carry this provider's timeout).
+SPEECH_TIMEOUT_SECONDS = 60
+
 
 class SpeechProviderUnavailableError(RuntimeError):
     pass
@@ -14,7 +19,7 @@ class HuggingFaceSTTProvider:
             raise ValueError("STT_INFERENCE_URL is required")
         self.settings = settings
         self.endpoint = settings.stt_inference_url
-        self.client = client or httpx.AsyncClient(timeout=60)
+        self.client = client or httpx.AsyncClient(timeout=SPEECH_TIMEOUT_SECONDS)
 
     async def transcribe(self, audio: bytes, media_type: str, language: str | None = None) -> Transcript:
         token = self.settings.stt_api_key or self.settings.hf_token
@@ -27,6 +32,7 @@ class HuggingFaceSTTProvider:
                 headers=headers,
                 content=audio,
                 params={"language": language} if language else None,
+                timeout=SPEECH_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             body = response.json()
@@ -51,7 +57,7 @@ class HuggingFaceTTSProvider:
             raise ValueError("TTS_INFERENCE_URL is required")
         self.settings = settings
         self.endpoint = settings.tts_inference_url
-        self.client = client or httpx.AsyncClient(timeout=60)
+        self.client = client or httpx.AsyncClient(timeout=SPEECH_TIMEOUT_SECONDS)
 
     async def synthesize(
         self, text: str, language: str, voice: str | None = None, speed: float | None = None
@@ -71,6 +77,7 @@ class HuggingFaceTTSProvider:
                         "speed": speed or self.settings.tts_speed,
                     },
                 },
+                timeout=SPEECH_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             media_type = response.headers.get("content-type", "audio/wav").split(";")[0]

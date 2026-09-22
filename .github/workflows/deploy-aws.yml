@@ -1,0 +1,190 @@
+name: Deploy to AWS
+
+# Deploys the API, worker and UI to the ECS stack in infra/aws.
+#
+# This workflow deliberately does NOT run `terraform apply`. It registers new task definition
+# revisions from the *live* ones with a new image tag, so it needs no Terraform state, no
+# tfvars file in CI, and cannot drift anything but the image. Structural changes (new
+# variables, new resources) stay manual: see infra/aws/README.md and docs/DEPLOY-AWS.md.
+#
+# Prerequisite: Terraform has been applied once by hand, the ECR repository exists, and the
+# repository configuration below is set (Settings -> Secrets and variables -> Actions).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "docker/**"
+      - "migrations/**"
+      - "prompts/**"
+      - "scripts/**"
+      - "frontend/**"
+      - ".github/workflows/deploy-aws.yml"
+
+permissions:
+  id-token: write # OIDC role assumption; no long-lived AWS keys
+  contents: read
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  CLUSTER_NAME: ${{ vars.ECS_CLUSTER_NAME }}
+  API_SERVICE: ${{ vars.ECS_API_SERVICE }}
+  WORKER_SERVICE: ${{ vars.ECS_WORKER_SERVICE }}
+  MIGRATE_TASK_DEFINITION: ${{ vars.ECS_MIGRATE_TASK_DEFINITION }}
+  PRIVATE_SUBNETS: ${{ vars.PRIVATE_SUBNET_IDS }}
+  TASK_SECURITY_GROUP: ${{ vars.TASK_SECURITY_GROUP_ID }}
+
+jobs:
+  deploy:
+    name: Build, migrate and roll the services
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Short image tag
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "${ECR_REPOSITORY%%/*}"
+
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          platforms: linux/amd64 # Fargate runs x86_64 by default
+          push: true
+          tags: |
+            ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache
+          cache-to: type=registry,ref=${{ env.ECR_REPOSITORY }}:buildcache,mode=max
+
+      # Register a new revision for each task definition with the new image. The fields are
+      # projected explicitly instead of deleting the read-only ones the API rejects.
+      - name: Register new task definition revisions
+        run: |
+          set -euo pipefail
+          register() {
+            aws ecs describe-task-definition --task-definition "$1" \
+              --query 'taskDefinition.{family:family,taskRoleArn:taskRoleArn,executionRoleArn:executionRoleArn,networkMode:networkMode,containerDefinitions:containerDefinitions,volumes:volumes,placementConstraints:placementConstraints,requiresCompatibilities:requiresCompatibilities,cpu:cpu,memory:memory,runtimePlatform:runtimePlatform}' \
+              --output json > /tmp/revision.json
+            jq --arg image "$ECR_REPOSITORY:$IMAGE_TAG" '.containerDefinitions[0].image = $image' \
+              /tmp/revision.json > /tmp/revision-final.json
+            aws ecs register-task-definition --cli-input-json file:///tmp/revision-final.json \
+              --query 'taskDefinition.taskDefinitionArn' --output text
+          }
+          echo "MIGRATE_TASK_ARN=$(register "$MIGRATE_TASK_DEFINITION")" >> "$GITHUB_ENV"
+          echo "API_TASK_ARN=$(register "${MIGRATE_TASK_DEFINITION%-migrate}-api")" >> "$GITHUB_ENV"
+          echo "WORKER_TASK_ARN=$(register "${MIGRATE_TASK_DEFINITION%-migrate}-worker")" >> "$GITHUB_ENV"
+
+      # The schema moves before the new code runs, and a failed migration stops the deploy
+      # with the previous revision still serving.
+      - name: Run the migration task
+        run: |
+          set -euo pipefail
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER_NAME" \
+            --task-definition "$MIGRATE_TASK_ARN" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$PRIVATE_SUBNETS],securityGroups=[$TASK_SECURITY_GROUP],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' --output text)
+          aws ecs wait tasks-stopped --cluster "$CLUSTER_NAME" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER_NAME" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::migration task exited with $EXIT_CODE; the API and worker were not touched"
+            aws logs tail "/ecs/$MIGRATE_TASK_DEFINITION" --since 15m || true
+            exit 1
+          fi
+
+      # A rolling replacement: minimum_healthy_percent=100 / maximum_percent=200 with the
+      # circuit breaker on, so a task that never passes /health/live rolls back by itself.
+      - name: Roll the API and the worker
+        run: |
+          set -euo pipefail
+          for pair in "$API_SERVICE:$API_TASK_ARN" "$WORKER_SERVICE:$WORKER_TASK_ARN"; do
+            SERVICE="${pair%%:*}"
+            TASK_DEFINITION="${pair#*:}"
+            aws ecs update-service --cluster "$CLUSTER_NAME" --service "$SERVICE" \
+              --task-definition "$TASK_DEFINITION" --query 'service.serviceName' --output text
+          done
+          aws ecs wait services-stable --cluster "$CLUSTER_NAME" \
+            --services "$API_SERVICE" "$WORKER_SERVICE"
+
+  frontend:
+    name: Build and publish the UI
+    runs-on: ubuntu-latest
+    needs: deploy # the API is live before the bundle that calls it
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # VITE_* values are compiled into the bundle, so this is where the API origin is set,
+      # not in the ECS task definition.
+      - run: npm run build
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_AUTH_ENABLED: ${{ vars.VITE_AUTH_ENABLED }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload the bundle and invalidate the CDN
+        working-directory: .
+        run: |
+          set -euo pipefail
+          aws s3 sync frontend/dist "s3://${{ vars.FRONTEND_BUCKET }}" --delete \
+            --exclude "index.html" --cache-control "public,max-age=31536000,immutable"
+          aws s3 cp frontend/dist/index.html "s3://${{ vars.FRONTEND_BUCKET }}/index.html" \
+            --cache-control "no-cache"
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" --paths "/*"
+
+# Required repository configuration (Settings -> Secrets and variables -> Actions):
+#
+#   Secrets   AWS_ROLE_ARN               IAM role assumed through OIDC, scoped to this repo
+#   Variables AWS_REGION                 region of the stack
+#             ECR_REPOSITORY             output: ecr_repository_url
+#             ECS_CLUSTER_NAME           output: cluster_name
+#             ECS_API_SERVICE            output: api_service_name
+#             ECS_WORKER_SERVICE         output: worker_service_name
+#             ECS_MIGRATE_TASK_DEFINITION output: migrate_task_definition
+#             PRIVATE_SUBNET_IDS         output: private_subnet_ids
+#             TASK_SECURITY_GROUP_ID     output: task_security_group_id
+#             FRONTEND_BUCKET            output: frontend_bucket
+#             CLOUDFRONT_DISTRIBUTION_ID output: cloudfront_distribution_id
+#             VITE_API_BASE_URL          e.g. https://api.example.com/api/v1
+#             VITE_AUTH_ENABLED          "true"
+#
+# `terraform output -json` in infra/aws prints all of the ids above at once.
+

@@ -22,3 +22,12 @@ uploads/
 tmp/
 *.log
 
+# Terraform (infra/aws). State and plan files can hold secrets, and *.tfvars holds the
+# provider token and the bootstrap password.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+*.tfvars
+

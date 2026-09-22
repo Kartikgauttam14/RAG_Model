@@ -1,0 +1,262 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+#
+# Render Blueprint for the Mansam evidence-first RAG platform.
+# Step-by-step instructions for this file: docs/DEPLOY-RENDER.md
+#
+# Shape of the deployment:
+#   mansam-api   Docker web service  -> FastAPI *and* the Celery ingestion worker in one
+#                                      container, because the worker reads
+#                                      `document_versions.storage_path`, i.e. the uploaded
+#                                      file the API just wrote to `uploads/`. Render cannot
+#                                      share a filesystem between two services, so the two
+#                                      processes have to share one container.
+#   mansam-ui    static site         -> the React build, CDN-served
+#   mansam-db    Render Postgres 16  -> application tables + pgvector
+#   mansam-kv    Render Key Value    -> Celery broker and rate-limit counters
+#
+# Everything lives in one region so the services can talk over Render's private network.
+# Replace `oregon` with the region closest to the users, consistently, in every block below.
+
+previews:
+  generation: off
+
+services:
+  # ------------------------------------------------------------------------------- API
+  - type: web
+    name: mansam-api
+    runtime: docker
+    region: oregon
+    # `starter` is Render's smallest paid tier. The API and the Celery worker share this
+    # plan, and PDF/XLSX extraction is the memory-hungry part, so raise this to a larger
+    # compute plan before ingesting the 25 MB files MAX_UPLOAD_SIZE_MB allows.
+    plan: starter
+    branch: main
+    autoDeployTrigger: checksPass
+    dockerfilePath: ./docker/backend.Dockerfile
+    dockerContext: .
+    # Both processes in one container: the worker first, then uvicorn as PID 1 through
+    # `exec` so Render's SIGTERM reaches the server. The Dockerfile CMD is overridden here.
+    dockerCommand: "/bin/sh -c \"celery -A app.workers.celery_app:celery_app worker --loglevel=INFO --concurrency=2 & exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers\""
+    # Runs on separate compute before the new instance starts, so it only ever touches the
+    # database. alembic.ini points at /app/migrations in the image, and migrations/env.py
+    # takes the URL from DATABASE_URL.
+    preDeployCommand: alembic -c alembic.ini upgrade head
+    # Liveness only: /health/ready also pings Postgres and Redis, and a blip on either
+    # would otherwise fail the deploy.
+    healthCheckPath: /health/live
+    maxShutdownDelaySeconds: 120
+    # Optional persistent disk: uncomment to keep uploaded sources across deploys and
+    # restarts. Read docs/DEPLOY-RENDER.md, "Uploaded files", first - a disk pins the
+    # service to a single instance and disables zero-downtime deploys.
+    # disk:
+    #   name: mansam-uploads
+    #   mountPath: /app/uploads
+    #   sizeGB: 5
+    envVars:
+      - key: APP_ENV
+        value: production
+      # Required by app/config/settings.py::validate_runtime outside development.
+      - key: AUTHENTICATION_ENABLED
+        value: "true"
+      - key: APP_NAME
+        value: Mansam RAG
+      - key: API_PREFIX
+        value: /api/v1
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_USER_CONTENT
+        value: "false"
+      # Pinned so the process, the Dockerfile EXPOSE and Render's port scanner agree.
+      - key: PORT
+        value: "8000"
+      - key: PUBLIC_BASE_URL
+        fromService:
+          name: mansam-api
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+      # Must be the exact browser origin of the UI, scheme included, no trailing slash.
+      # After the first deploy, confirm the static site's real URL and update this value
+      # (and add any custom domain to it) if Render had to disambiguate the name.
+      - key: FRONTEND_ORIGINS
+        value: https://mansam-ui.onrender.com
+
+      # Render's internal Postgres URL is `postgresql://...`; SQLAlchemy needs the asyncpg
+      # driver in the scheme, so paste it as `postgresql+asyncpg://...` (see the doc).
+      # Use the *internal* URL: private network, no TLS handshake, no egress cost.
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          name: mansam-kv
+          type: keyvalue
+          property: connectionString
+
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_MINUTES
+        value: "30"
+      - key: REFRESH_TOKEN_DAYS
+        value: "14"
+      # Consumed by scripts/bootstrap_admin.py. Set both before the first deploy; the
+      # script is idempotent, and the password stays out of the repository.
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        sync: false
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+
+      # Generation. HF_INFERENCE_URL is the base URL only: app/llm/huggingface.py appends
+      # `/v1/chat/completions` itself. The Hugging Face router, vLLM, TGI and Ollama all
+      # speak this shape. Required outside development.
+      - key: LLM_PROVIDER
+        value: huggingface
+      - key: HF_API_MODE
+        value: openai
+      - key: HF_INFERENCE_URL
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: HF_MODEL
+        sync: false
+      # Optional per-stage models: the planner, verifier and memory extractor can run on a
+      # smaller served model than the answer draft.
+      - key: LLM_DRAFT_MODEL
+        sync: false
+      - key: LLM_FAST_MODEL
+        sync: false
+      - key: LLM_TIMEOUT_SECONDS
+        value: "60"
+
+      # Embeddings. A URL containing `/v1/embeddings` is spoken to with the OpenAI batch
+      # payload; anything else uses the native HF/TEI `{"inputs": [...]}` shape.
+      # EMBEDDING_DIMENSION must match the model (intfloat/multilingual-e5-large = 1024).
+      - key: EMBEDDING_PROVIDER
+        value: huggingface
+      - key: EMBEDDING_INFERENCE_URL
+        sync: false
+      - key: EMBEDDING_MODEL
+        value: intfloat/multilingual-e5-large
+      - key: EMBEDDING_DIMENSION
+        value: "1024"
+
+      # Reranking: leave RERANK_INFERENCE_URL empty to run on reciprocal rank fusion alone
+      # (*the* choice on Render, which has no GPU) or point it at a hosted reranker. A URL
+      # ending in `/rerank` is treated as Text Embeddings Inference.
+      - key: RERANK_PROVIDER
+        value: disabled
+      - key: RERANK_INFERENCE_URL
+        sync: false
+      - key: RERANK_MODEL
+        value: BAAI/bge-reranker-v2-m3
+
+      # Speech is off unless a hosted endpoint is supplied; the UI then keeps text input
+      # available and reports 503 for the microphone and playback controls.
+      - key: STT_PROVIDER
+        value: disabled
+      - key: TTS_PROVIDER
+        value: disabled
+      - key: OCR_PROVIDER
+        value: disabled
+
+      # Retrieval and ingestion sizing. RERANK_TOP_K 8 is the measured floor for this
+      # corpus; RAG_VERIFY_ENABLED=false removes one full generation per answer.
+      - key: RAG_VECTOR_TOP_K
+        value: "20"
+      - key: RAG_LEXICAL_TOP_K
+        value: "20"
+      - key: RERANK_TOP_K
+        value: "8"
+      - key: RAG_MIN_SCORE
+        value: "0.35"
+      - key: RAG_MAX_CONTEXT_CHARS
+        value: "16000"
+      - key: RAG_VERIFY_ENABLED
+        value: "true"
+      - key: KEEP_MODEL_WARM
+        value: "false"
+      - key: PLANNER_LLM_MIN_WORDS
+        value: "6"
+      - key: CHUNK_TARGET_CHARS
+        value: "1600"
+      - key: CHUNK_MAX_CHARS
+        value: "2400"
+      - key: CHUNK_OVERLAP_CHARS
+        value: "200"
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "25"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "30"
+      - key: LONG_TERM_MEMORY_ENABLED
+        value: "true"
+      # false extracts memories after the answer is committed instead of holding the reply
+      # behind one more generation and embedding call.
+      - key: LONG_TERM_MEMORY_INLINE
+        value: "false"
+      - key: URL_INGESTION_ENABLED
+        value: "false"
+
+  # ------------------------------------------------------------------------------- UI
+  - type: web
+    name: mansam-ui
+    runtime: static
+    branch: main
+    autoDeployTrigger: checksPass
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: ./frontend/dist
+    # Client-side routing: serve index.html for any path that is not a file on disk.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: Referrer-Policy
+        value: no-referrer
+    envVars:
+      # Render's dependency auto-detection looks for package.json at the repository root,
+      # which is not where the frontend lives; the build command installs its own.
+      - key: SKIP_INSTALL_DEPS
+        value: "true"
+      # Both are baked in at build time by Vite, so changing either needs a redeploy.
+      - key: VITE_API_BASE_URL
+        sync: false
+      - key: VITE_AUTH_ENABLED
+        value: "true"
+
+  # ------------------------------------------------------------------------ Key Value
+  - type: keyvalue
+    name: mansam-kv
+    region: oregon
+    # A plan with persistence, so queued ingestion jobs survive a restart.
+    plan: starter
+    # Required for a Celery broker: never evict a queued job to make room.
+    maxmemoryPolicy: noeviction
+    # Internal connections only.
+    ipAllowList: []
+
+databases:
+  - name: mansam-db
+    region: oregon
+    # Confirm the current instance-type name in the Dashboard dropdown before changing it.
+    # Postgres plans can be raised in place (Plan -> Update), never lowered. Do not use the
+    # free plan here: Render deletes free databases 30 days after creation.
+    plan: basic-256mb
+    databaseName: rag
+    user: rag
+    postgresMajorVersion: "16"
+    # Internal connections only: same-region services are unaffected by this list.
+    ipAllowList: []
+

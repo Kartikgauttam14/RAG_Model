@@ -1,0 +1,51 @@
+# Keeps the Docker build context small and prevents local-only material from
+# reaching a production image. Both Dockerfiles are built with the repository root
+# as context (`docker build -f docker/backend.Dockerfile .`), so without this file the
+# context carries `.venv`, `node_modules`, the `uploads/` corpus and every API log.
+# Nothing listed here is COPY-ed by docker/backend.Dockerfile or docker/frontend.Dockerfile.
+
+# Version control and CI metadata
+.git
+.gitignore
+.github
+
+# Local secrets and environment files (compose passes these at runtime instead)
+.env
+.env.*
+
+# Python virtualenv, caches and coverage artifacts
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+backend/.mypy_cache/
+.mypy_cache/
+backend/.ruff_cache/
+.ruff_cache/
+backend/.pytest_cache/
+.pytest_cache/
+backend/.coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Node modules and previously built frontend assets (the image builds its own)
+**/node_modules/
+frontend/dist/
+frontend/tsconfig.*.tsbuildinfo
+
+# Runtime data: uploaded sources, scratch work and local logs
+uploads/
+tmp/
+*.log
+
+# Local-only corpora, notebooks, skill bundles and evaluation harness data
+.agents/
+.claude/
+Mansam Books/
+knowledge/
+evaluation/
+*.ipynb
+docker-compose.yml
+skills-lock.json

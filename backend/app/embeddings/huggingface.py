@@ -1,6 +1,9 @@
 import httpx
 
 from app.config import Settings
+from app.monitoring.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class EmbeddingUnavailableError(RuntimeError):
@@ -25,10 +28,11 @@ class HuggingFaceEmbeddingProvider:
         return "/v1/embeddings" in normalized or "integrate.api.nvidia.com" in normalized
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return await self._embed([f"passage: {text}" for text in texts])
+        prefix = self.settings.embedding_passage_prefix
+        return await self._embed([f"{prefix}{text}" for text in texts])
 
     async def embed_query(self, text: str) -> list[float]:
-        rows = await self._embed([f"query: {text}"])
+        rows = await self._embed([f"{self.settings.embedding_query_prefix}{text}"])
         return rows[0]
 
     async def _embed(self, inputs: list[str]) -> list[list[float]]:
@@ -39,6 +43,7 @@ class HuggingFaceEmbeddingProvider:
                     self.endpoint,
                     headers={**headers, "Content-Type": "application/json"},
                     json={"input": inputs, "model": self.settings.embedding_model},
+                    timeout=self.settings.embedding_timeout_seconds,
                 )
                 response.raise_for_status()
                 body = response.json()
@@ -53,6 +58,7 @@ class HuggingFaceEmbeddingProvider:
                     self.endpoint,
                     headers=headers,
                     json={"inputs": inputs, "options": {"wait_for_model": True}},
+                    timeout=self.settings.embedding_timeout_seconds,
                 )
                 response.raise_for_status()
                 body = response.json()
@@ -70,4 +76,12 @@ class HuggingFaceEmbeddingProvider:
         except (httpx.TimeoutException, httpx.HTTPError, TypeError, ValueError) as exc:
             if isinstance(exc, EmbeddingUnavailableError):
                 raise
+            # The wrapper message alone hides whether the endpoint returned a status, refused
+            # the connection or timed out, which is exactly what an outage investigation needs.
+            logger.warning(
+                "embedding_request_failed",
+                endpoint=self.endpoint,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             raise EmbeddingUnavailableError("Embedding provider is unavailable") from exc

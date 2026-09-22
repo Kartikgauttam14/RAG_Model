@@ -25,19 +25,38 @@ class QueryPlan:
     clarification_question: str | None = None
     normalized_query: str = ""
     filters: dict[str, Any] = field(default_factory=dict)
+    # "deterministic" when the cheap rule-based plan was used for a short message, "llm"
+    # when the model rewrote the query. The chat service escalates a deterministic plan to
+    # the model once if its answer turns out to be ungrounded.
+    planned_by: str = "deterministic"
 
 
 class QueryPlanner:
-    def __init__(self, llm: LLMProvider | None, prompts: PromptRepository) -> None:
+    def __init__(
+        self,
+        llm: LLMProvider | None,
+        prompts: PromptRepository,
+        min_words_for_llm: int = 0,
+        model: str | None = None,
+    ) -> None:
         self.llm = llm
         self.prompts = prompts
+        self.min_words_for_llm = min_words_for_llm
+        self.model = model
 
-    async def plan(self, query: str, history: list[dict[str, str]]) -> QueryPlan:
+    async def plan(self, query: str, history: list[dict[str, str]], *, force_llm: bool = False) -> QueryPlan:
         normalized = " ".join(query.split()).strip()
         if not normalized:
             raise ValueError("Query cannot be empty")
         fallback = self._fallback(normalized, history)
         if self.llm is None:
+            return fallback
+        if not force_llm and not history and len(normalized.split()) < self.min_words_for_llm:
+            # A short first-turn question has no history to resolve and no entity to
+            # disambiguate, so the deterministic plan is enough. Skipping the model
+            # here removes one generation from the critical path of most voice and
+            # one-line questions. A greeting is the exception the service handles by
+            # escalating here with force_llm when the cheap plan finds no answer.
             return fallback
         context = history[-8:]
         try:
@@ -52,6 +71,7 @@ class QueryPlanner:
                 temperature=0,
                 max_tokens=500,
                 response_format="json",
+                model=self.model,
             )
             payload = _parse_json(result.text)
             return QueryPlan(
@@ -64,6 +84,7 @@ class QueryPlanner:
                 clarification_question=_optional_string(payload.get("clarification_question")),
                 normalized_query=str(payload.get("normalized_query") or normalized)[:2000],
                 filters=_clean_filters(payload.get("filters", {})),
+                planned_by="llm",
             )
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
             return fallback

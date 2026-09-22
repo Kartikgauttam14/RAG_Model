@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from app.auth import Principal, get_current_principal
 from app.config import Settings, get_settings
 from app.dependencies import get_stt, get_tts
-from app.speech import SpeechToTextProvider, TextToSpeechProvider
+from app.speech import SpeechProviderUnavailableError, SpeechToTextProvider, TextToSpeechProvider
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -44,7 +44,12 @@ async def transcribe(
         raise HTTPException(status_code=413, detail="Audio is empty or too large")
     if not (audio.content_type or "").startswith("audio/"):
         raise HTTPException(status_code=415, detail="An audio media type is required")
-    result = await provider.transcribe(data, audio.content_type or "audio/webm", language)
+    try:
+        result = await provider.transcribe(data, audio.content_type or "audio/webm", language)
+    except SpeechProviderUnavailableError as exc:
+        # The provider exists but the speech server is down or has no model installed;
+        # that is an unavailable dependency (503), not a server fault (500).
+        raise HTTPException(status_code=503, detail="Speech recognition is unavailable") from exc
     low = result.confidence is not None and result.confidence < settings.stt_min_confidence
     return TranscriptResponse(
         transcript=result.text,
@@ -60,7 +65,10 @@ async def synthesize(
     _: Principal = Depends(get_current_principal),
     provider: TextToSpeechProvider = Depends(get_tts),
 ) -> AudioResponse:
-    result = await provider.synthesize(payload.text, payload.language, payload.voice, payload.speed)
+    try:
+        result = await provider.synthesize(payload.text, payload.language, payload.voice, payload.speed)
+    except SpeechProviderUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Speech synthesis is unavailable") from exc
     return AudioResponse(
         audio_base64=base64.b64encode(result.content).decode(),
         media_type=result.media_type,

@@ -34,23 +34,35 @@ class Settings(BaseSettings):
     hf_inference_url: str | None = None
     hf_api_mode: Literal["openai", "native"] = "openai"
     llm_timeout_seconds: float = 60
+    # Optional per-stage model routing. The answer draft is the quality-critical call, so
+    # it can use the largest served model, while the planner, verifier and memory
+    # extractor run on a smaller one. Both default to HF_MODEL.
+    llm_draft_model: str | None = None
+    llm_fast_model: str | None = None
 
     embedding_provider: str = "huggingface"
     embedding_model: str = "intfloat/multilingual-e5-large"
     embedding_inference_url: str | None = None
     embedding_dimension: int = 1024
     embedding_timeout_seconds: float = 45
+    embedding_query_prefix: str = "query: "
+    embedding_passage_prefix: str = "passage: "
 
     rerank_provider: str = "huggingface"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     rerank_inference_url: str | None = None
     rerank_timeout_seconds: float = 30
+    rerank_batch_size: int = Field(32, ge=1, le=256)
 
     stt_provider: str = "huggingface"
     stt_model: str = "openai/whisper-large-v3-turbo"
     stt_inference_url: str | None = None
     stt_api_key: str | None = None
     stt_min_confidence: float = Field(0.70, ge=0, le=1)
+    # Whisper biases decoding toward whatever vocabulary this prompt contains, which is
+    # what keeps brand and product names ("Mamlakati", "Qanun") from being transcribed as
+    # unrelated words. Only used by the OpenAI-compatible provider.
+    stt_prompt: str | None = None
 
     tts_provider: str = "huggingface"
     tts_model: str = "facebook/mms-tts-eng"
@@ -66,9 +78,21 @@ class Settings(BaseSettings):
     rag_vector_top_k: int = Field(20, ge=1, le=100)
     rag_lexical_top_k: int = Field(20, ge=1, le=100)
     rerank_top_k: int = Field(8, ge=1, le=30)
+    lexical_text_search_config: str = "english"
     rag_min_score: float = Field(0.35, ge=0, le=1)
     rag_min_evidence: int = Field(1, ge=1, le=10)
     rag_max_context_chars: int = Field(16000, ge=1000, le=100000)
+    # Verification is a second full generation over the same evidence. Keeping it on is the
+    # strongest guarantee the product offers (an independent re-check plus regeneration), but
+    # it roughly doubles the time to an answer, so a deployment with a hard latency budget can
+    # turn it off: the admission gate, the model's own `grounded` flag and citation resolution
+    # still apply, and the stored status becomes `verification_skipped`.
+    rag_verify_enabled: bool = True
+    # The planner is an extra generation on the critical path. A short first-turn
+    # question carries no pronouns or history to resolve, so the deterministic plan
+    # is used for messages below this many words and no generation is spent. Set to
+    # 0 to always ask the model, or raise it to trust the model with shorter turns.
+    planner_llm_min_words: int = Field(6, ge=0, le=200)
     chunk_target_chars: int = Field(1600, ge=200, le=10000)
     chunk_max_chars: int = Field(2400, ge=300, le=20000)
     chunk_overlap_chars: int = Field(200, ge=0, le=2000)
@@ -84,6 +108,15 @@ class Settings(BaseSettings):
         "text/csv",
         "application/json",
     ]
+    ingestion_excluded_sheets: Annotated[list[str], NoDecode] = []
+    ingestion_workflow_columns: Annotated[list[str], NoDecode] = [
+        "status",
+        "state",
+        "review status",
+        "reviewed by",
+        "author",
+    ]
+    ingestion_unpublished_markers: Annotated[list[str], NoDecode] = ["draft", "pending", "tbd", "todo", "wip"]
     url_ingestion_enabled: bool = False
     url_allowed_hosts: Annotated[list[str], NoDecode] = []
     url_ingestion_max_pages: int = Field(25, ge=1, le=500)
@@ -94,8 +127,28 @@ class Settings(BaseSettings):
     memory_ttl_seconds: int = 86400
     long_term_memory_enabled: bool = True
     long_term_memory_min_confidence: float = Field(0.85, ge=0, le=1)
+    # Ollama unloads a model after five minutes of inactivity, and neither a per-request
+    # `keep_alive` nor the OLLAMA_KEEP_ALIVE variable changes that through its
+    # OpenAI-compatible endpoint (both were measured). When this is true the API sends a
+    # one-token completion every `keep_warm_interval_seconds` so the weights stay on the GPU
+    # and the first question after a pause does not pay a multi-gigabyte reload.
+    keep_model_warm: bool = False
+    keep_warm_interval_seconds: int = Field(240, ge=30, le=3600)
+    # Long-term memory extraction costs one generation plus one embedding call. When
+    # this is false the work runs after the response is committed instead of holding
+    # the answer, which removes a full generation from every question. Keep it true
+    # only where a caller must observe stored memories in the same request.
+    long_term_memory_inline: bool = True
 
-    @field_validator("frontend_origins", "allowed_upload_types", "url_allowed_hosts", mode="before")
+    @field_validator(
+        "frontend_origins",
+        "allowed_upload_types",
+        "url_allowed_hosts",
+        "ingestion_excluded_sheets",
+        "ingestion_workflow_columns",
+        "ingestion_unpublished_markers",
+        mode="before",
+    )
     @classmethod
     def parse_list_env_values(cls, value: object) -> object:
         """Accept both JSON arrays and comma-separated values from environment variables."""

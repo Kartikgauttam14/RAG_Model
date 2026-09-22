@@ -22,6 +22,7 @@ class ScriptedLLM:
     async def generate(self, messages: list[LLMMessage], **_: object) -> LLMResult:
         self.calls.append(messages)
         request = messages[-1].content
+        response: dict[str, Any]
         if '"message"' in request:
             response = {"intent": "knowledge_question", "language": "en", "normalized_query": "delivery time"}
         elif '"draft_answer"' in request:
@@ -51,6 +52,63 @@ class FakeRetriever:
     async def retrieve(self, db: Any, **kwargs: Any) -> RetrievalResult:
         self.queries.append(kwargs["query"])
         return self.result
+
+    async def count_evidence(self, db: Any, **_: Any) -> list[Any]:
+        """The service asks for recorded count fields; these tests supply none."""
+        return []
+
+
+class SequentialRetriever:
+    """Returns a different result per call and records the filters it was given."""
+
+    def __init__(self, results: list[RetrievalResult]) -> None:
+        self.results = results
+        self.calls: list[dict[str, Any]] = []
+
+    async def retrieve(self, db: Any, **kwargs: Any) -> RetrievalResult:
+        self.calls.append(kwargs)
+        return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+
+    async def count_evidence(self, db: Any, **_: Any) -> list[Any]:
+        return []
+
+
+class FilteredPlannerLLM:
+    """Plans with a `language` filter and only grounds the answer once retrieval widens."""
+
+    def __init__(self, *, chunk_id: uuid.UUID, ground_on_widened_only: bool = True) -> None:
+        self.chunk_id = str(chunk_id)
+        self.ground_on_widened_only = ground_on_widened_only
+        self.answers = 0
+
+    async def generate(self, messages: list[LLMMessage], **_: object) -> LLMResult:
+        request = messages[-1].content
+        if '"message"' in request:
+            response: dict[str, Any] = {
+                "intent": "knowledge_question",
+                "language": "ar",
+                "normalized_query": "كم عدد بوتيكات منصم في السعودية",
+                "filters": {"language": "ar"},
+            }
+        elif '"draft_answer"' in request:
+            response = {
+                "supported": True,
+                "answered_question": True,
+                "recommended_action": "accept",
+                "confidence": 0.9,
+            }
+        elif '"question"' in request:
+            self.answers += 1
+            ground = self.answers > 1 or not self.ground_on_widened_only
+            response = {
+                "answer": "ستة بوتيكات في السعودية.",
+                "citation_chunk_ids": [self.chunk_id],
+                "grounded": ground,
+                "conflicts": [],
+            }
+        else:
+            response = {"memories": []}
+        return LLMResult(text=json.dumps(response), model="test")
 
 
 class FakeMemory:
@@ -105,13 +163,17 @@ def _evidence() -> RetrievedEvidence:
     )
 
 
-def _service(llm: Any, retriever: FakeRetriever, memory: FakeMemory) -> ChatService:
+def _service(llm: Any, retriever: Any, memory: Any) -> ChatService:
+    # The doubles stand in for HybridRetriever/MemoryService, so they are typed as ``Any``
+    # here instead of pretending to satisfy the real signatures. planner_llm_min_words=0
+    # keeps the scripted LLM in charge of planning: these tests assert the plan the model
+    # returns, and the default short-question fast path would skip that call.
     return ChatService(
         llm=llm,
         retriever=retriever,
         memory=memory,
         prompts=PromptRepository(Path(__file__).parents[3] / "prompts"),
-        settings=Settings(),
+        settings=Settings(planner_llm_min_words=0),
     )
 
 
@@ -128,7 +190,7 @@ async def test_chat_service_persists_verified_answer_and_retrieval_candidates() 
     llm = ScriptedLLM(chunk_id=evidence.chunk_id)
     memory = FakeMemory()
     retriever = FakeRetriever(retrieval)
-    db = FakeSession()
+    db: Any = FakeSession()
     events: list[str] = []
 
     async def record_event(state: str) -> None:
@@ -154,12 +216,53 @@ async def test_chat_service_persists_verified_answer_and_retrieval_candidates() 
 
 
 @pytest.mark.asyncio
+async def test_chat_service_widens_retrieval_when_filtered_answer_is_ungrounded() -> None:
+    filtered_evidence = _evidence()
+    widened_evidence = _evidence()
+    filtered = RetrievalResult(
+        evidence=[filtered_evidence],
+        latency_ms=5,
+        reranker_used=False,
+        candidate_chunk_ids=[filtered_evidence.chunk_id],
+        fallback_reason="reranker_not_configured_rrf_used",
+    )
+    widened = RetrievalResult(
+        evidence=[widened_evidence],
+        latency_ms=7,
+        reranker_used=False,
+        candidate_chunk_ids=[widened_evidence.chunk_id, filtered_evidence.chunk_id],
+        fallback_reason="reranker_not_configured_rrf_used",
+    )
+    llm = FilteredPlannerLLM(chunk_id=widened_evidence.chunk_id)
+    retriever = SequentialRetriever([filtered, widened])
+    memory = FakeMemory()
+    db: Any = FakeSession()
+
+    response = await _service(llm, retriever, memory).respond(
+        db,
+        Principal(uuid.uuid4(), Role.admin, "default"),
+        ChatRequest(message="كم عدد بوتيكات منصم في السعودية؟"),
+        "request-3",
+    )
+
+    # The planner's `language` filter hid the answer-bearing chunk, so the
+    # service must retry with no filters and keep the grounded answer.
+    assert [call["filters"] for call in retriever.calls] == [{"language": "ar"}, {}]
+    assert response.grounded
+    assert response.citations[0].chunk_id == widened_evidence.chunk_id
+    retrieval_event = next(value for value in db.added if value.__class__.__name__ == "RetrievalEvent")
+    assert retrieval_event.filters == {}
+    assert retrieval_event.selected_chunk_ids == [str(widened_evidence.chunk_id)]
+    assert db.commits == 1
+
+
+@pytest.mark.asyncio
 async def test_chat_service_rolls_back_when_llm_is_unavailable() -> None:
     evidence = _evidence()
     retriever = FakeRetriever(
         RetrievalResult(evidence=[evidence], latency_ms=1, reranker_used=False, candidate_chunk_ids=[evidence.chunk_id])
     )
-    db = FakeSession()
+    db: Any = FakeSession()
     service = _service(FailingLLM(), retriever, FakeMemory())
 
     with pytest.raises(LLMUnavailableError):
