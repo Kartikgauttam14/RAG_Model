@@ -30,6 +30,47 @@ services:
       timeout: 3s
       retries: 20
 
+  # Local cross-encoder used as the retrieval precision stage, so ranking does not
+  # depend on a hosted reranking API. Point RERANK_INFERENCE_URL at
+  # http://localhost:8082/rerank. Host port 8082 (not 8081) because 8081 is commonly
+  # taken by other local tooling, and a port shadowed on the host makes the reranker
+  # silently unreachable. `gpus: all` is required because the image ships a CUDA
+  # build: without it the router exits with "libcuda.so.1: cannot open shared object".
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:1.8
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3"]
+    gpus: all
+    ports:
+      - "8082:80"
+    volumes:
+      - reranker_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 600s
+
+  # Local speech server for the microphone and the playback controls. It serves the
+  # OpenAI routes POST /v1/audio/transcriptions (faster-whisper) and POST /v1/audio/speech
+  # (Kokoro), so STT_PROVIDER=openai / TTS_PROVIDER=openai need no hosted speech token.
+  # The CPU image is deliberate: the 6 GB GPU is already shared by Ollama and the
+  # reranker, and a small Whisper model transcribes a question in about a second on CPU.
+  # Point STT_INFERENCE_URL at http://localhost:8083/v1/audio/transcriptions and
+  # TTS_INFERENCE_URL at http://localhost:8083/v1/audio/speech.
+  speech:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    ports:
+      - "8083:8000"
+    volumes:
+      - speech_models:/home/ubuntu/.cache/huggingface/hub
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
   backend:
     build:
       context: .
@@ -81,4 +122,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  reranker_data:
+  speech_models:
 

@@ -1,10 +1,24 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRecorder } from "../audio/useRecorder";
 import { AudioControls } from "../components/AudioControls";
 import { Sources } from "../components/Sources";
-import { ChatAnswer, sendChat, submitFeedback, transcribe } from "../services/api";
+import { ChatAnswer, streamChat, submitFeedback, transcribe } from "../services/api";
 
 type Message = { role: "user" | "assistant"; text: string; answer?: ChatAnswer };
+
+// The answer takes several model calls, so the stream reports each stage as it happens
+// and the footer shows what the assistant is doing instead of one static label.
+const PROGRESS: Record<string, string> = {
+  processing: "Understanding your question…",
+  understanding: "Reading the question…",
+  retrieving: "Searching the knowledge base…",
+  reranking: "Ranking the evidence…",
+  generating: "Writing the answer…",
+  verifying: "Checking the answer against the sources…",
+  complete: "ready",
+};
+
+const ARABIC = /[\u0600-\u06ff]/;
 
 export function ChatPage({ token }: { token: string }) {
   const [input, setInput] = useState("");
@@ -12,17 +26,34 @@ export function ChatPage({ token }: { token: string }) {
   const [conversationId, setConversationId] = useState<string>();
   const [state, setState] = useState("ready");
   const [error, setError] = useState("");
+  const [elapsed, setElapsed] = useState(0);
   const recorder = useRecorder();
+  const busy = state !== "ready";
+
+  // The answer chain runs on one GPU, so a second request started while the first is still
+  // in flight does not answer twice as fast - it queues behind the first and makes both
+  // look slow. The counter makes the wait legible instead of a frozen label.
+  useEffect(() => {
+    if (!busy) {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = window.setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 500);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   async function ask(text: string) {
     const clean = text.trim();
-    if (!clean) return;
+    if (!clean || busy) return;
     setMessages((current) => [...current, { role: "user", text: clean }]);
     setInput("");
-    setState("retrieving and verifying");
+    setState(PROGRESS.processing);
     setError("");
     try {
-      const answer = await sendChat(token, clean, conversationId);
+      const answer = await streamChat(token, clean, conversationId, (stage) =>
+        setState(PROGRESS[stage] ?? stage),
+      );
       setConversationId(answer.conversation_id);
       setMessages((current) => [...current, { role: "assistant", text: answer.answer, answer }]);
     } catch (reason) {
@@ -68,12 +99,16 @@ export function ChatPage({ token }: { token: string }) {
               <>
                 {message.answer.conflicts.length > 0 && <aside className="conflict">Sources disagree: {message.answer.conflicts.join(" ")}</aside>}
                 <Sources citations={message.answer.citations} />
-                <AudioControls token={token} text={message.answer.answer} language="en" />
+                <AudioControls
+                  token={token}
+                  text={message.answer.answer}
+                  language={ARABIC.test(message.answer.answer) ? "ar" : "en"}
+                />
                 <div className="feedback">
                   <button onClick={() => void submitFeedback(token, message.answer!.message_id, "helpful")}>Helpful</button>
                   <button onClick={() => void submitFeedback(token, message.answer!.message_id, "incorrect")}>Incorrect</button>
                   <button onClick={() => navigator.clipboard.writeText(message.text)}>Copy</button>
-                  <button onClick={() => void ask(messages[index - 1]?.text ?? "")}>Regenerate</button>
+                  <button disabled={busy} onClick={() => void ask(messages[index - 1]?.text ?? "")}>Regenerate</button>
                 </div>
               </>
             )}
@@ -83,12 +118,12 @@ export function ChatPage({ token }: { token: string }) {
       {error && <div className="error" role="alert">{error}</div>}
       <form className="composer" onSubmit={submit}>
         <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="Type your message…" aria-label="Message" rows={2} />
-        <button type="button" className={recorder.recording ? "recording" : ""} onClick={() => void toggleRecording()}>
+        <button type="button" className={recorder.recording ? "recording" : ""} disabled={busy} onClick={() => void toggleRecording()}>
           {recorder.recording ? "Stop" : "Speak"}
         </button>
-        <button type="submit" disabled={state !== "ready" || !input.trim()}>Send</button>
+        <button type="submit" disabled={busy || !input.trim()}>Send</button>
       </form>
-      <footer>{state}</footer>
+      <footer>{busy ? `${state} ${elapsed}s` : state}</footer>
     </main>
   );
 }

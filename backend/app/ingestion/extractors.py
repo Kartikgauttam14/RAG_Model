@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 from bs4 import BeautifulSoup
@@ -10,22 +11,33 @@ from docx import Document as DocxDocument
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
-from app.ingestion.normalize import normalize_text, remove_repeated_page_furniture
+from app.ingestion.normalize import normalize_text, remove_page_folios, remove_repeated_page_furniture
 from app.ingestion.sites import SPA_EXTRACTION_HINT, is_unrendered_spa
 from app.ingestion.types import ElementKind, ExtractedDocument, ExtractedElement
 
 MARKDOWN_HEADING = re.compile(r"^(#{1,6})\s+(.+)$")
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 class ExtractionError(ValueError):
     pass
 
 
-def extract_document(data: bytes, name: str, media_type: str) -> ExtractedDocument:
-    extractors = {
+def extract_document(
+    data: bytes,
+    name: str,
+    media_type: str,
+    excluded_sheets: list[str] | None = None,
+    workflow_columns: list[str] | None = None,
+    unpublished_markers: list[str] | None = None,
+) -> ExtractedDocument:
+    # ``Callable[..., ExtractedDocument]`` because the spreadsheet extractor also takes the
+    # ingestion filters, while the other extractors share the three-argument shape. Without
+    # the annotation mypy infers a union of signatures and refuses to call the result.
+    extractors: dict[str, Callable[..., ExtractedDocument]] = {
         "application/pdf": _extract_pdf,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _extract_docx,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": _extract_xlsx,
+        XLSX_MEDIA_TYPE: _extract_xlsx,
         "text/plain": _extract_text,
         "text/markdown": _extract_markdown,
         "text/html": _extract_html,
@@ -36,7 +48,12 @@ def extract_document(data: bytes, name: str, media_type: str) -> ExtractedDocume
     if extractor is None:
         raise ExtractionError(f"No extractor for {media_type}")
     try:
-        document = extractor(data, name, media_type)
+        if media_type == XLSX_MEDIA_TYPE:
+            document = _extract_xlsx(
+                data, name, media_type, excluded_sheets, workflow_columns, unpublished_markers
+            )
+        else:
+            document = extractor(data, name, media_type)
     except Exception as exc:
         if isinstance(exc, ExtractionError):
             raise
@@ -70,7 +87,7 @@ def _extract_pdf(data: bytes, name: str, media_type: str) -> ExtractedDocument:
         },
         needs_ocr=needs_ocr,
     )
-    return remove_repeated_page_furniture(document)
+    return remove_repeated_page_furniture(remove_page_folios(document))
 
 
 def _extract_docx(data: bytes, name: str, media_type: str) -> ExtractedDocument:
@@ -94,12 +111,27 @@ def _extract_docx(data: bytes, name: str, media_type: str) -> ExtractedDocument:
     return ExtractedDocument(name, media_type, elements, {"table_count": len(doc.tables)})
 
 
-def _extract_xlsx(data: bytes, name: str, media_type: str) -> ExtractedDocument:
+def _extract_xlsx(
+    data: bytes,
+    name: str,
+    media_type: str,
+    excluded_sheets: list[str] | None = None,
+    workflow_columns: list[str] | None = None,
+    unpublished_markers: list[str] | None = None,
+) -> ExtractedDocument:
     workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
     elements: list[ExtractedElement] = []
     sheet_names = list(workbook.sheetnames)
+    excluded = {sheet.strip().casefold() for sheet in excluded_sheets or [] if sheet.strip()}
+    workflow = {column.strip().casefold() for column in workflow_columns or [] if column.strip()}
+    markers = [marker.strip().casefold() for marker in unpublished_markers or [] if marker.strip()]
+    skipped_sheets: list[str] = []
+    unpublished_rows: list[dict[str, Any]] = []
     try:
         for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
+            if sheet.title.strip().casefold() in excluded:
+                skipped_sheets.append(sheet.title)
+                continue
             rows = [tuple(row) for row in sheet.iter_rows(values_only=True)]
             if not rows:
                 continue
@@ -109,11 +141,23 @@ def _extract_xlsx(data: bytes, name: str, media_type: str) -> ExtractedDocument:
                 if not any(value not in (None, "") for value in row):
                     continue
                 fields: list[str] = []
+                unpublished_in: list[str] = []
                 for column_index, value in enumerate(row):
                     if value in (None, ""):
                         continue
                     header = headers[column_index] if column_index < len(headers) else f"column_{column_index + 1}"
                     fields.append(f"{header}: {_cell_text(value)}")
+                    if header.strip().casefold() in workflow and _matches_marker(value, markers):
+                        unpublished_in.append(header)
+                if unpublished_in:
+                    unpublished_rows.append(
+                        {
+                            "sheet": sheet.title,
+                            "row_number": row_number,
+                            "columns": unpublished_in,
+                        }
+                    )
+                    continue
                 elements.append(
                     ExtractedElement(
                         text=f"Sheet: {sheet.title}\nRow: {row_number}\n" + "\n".join(fields),
@@ -133,7 +177,13 @@ def _extract_xlsx(data: bytes, name: str, media_type: str) -> ExtractedDocument:
         name,
         media_type,
         elements,
-        {"sheet_count": len(sheet_names), "sheet_names": sheet_names},
+        {
+            "sheet_count": len(sheet_names),
+            "sheet_names": sheet_names,
+            "excluded_sheets": skipped_sheets,
+            "unpublished_rows_skipped": len(unpublished_rows),
+            "unpublished_row_refs": unpublished_rows,
+        },
     )
 
 
@@ -164,6 +214,20 @@ def _cell_text(value: Any) -> str:
     if isinstance(value, str):
         return " ".join(value.split())
     return str(value)
+
+
+def _matches_marker(value: Any, markers: list[str]) -> bool:
+    """Report whether a workflow cell holds an unpublished/authoring marker such as ``Draft``.
+
+    Markers are matched as whole words so that legitimate values are never dropped by
+    accident (for example ``Status: "Depending on stock"`` must not match ``pending``).
+    """
+    if not markers:
+        return False
+    text = _cell_text(value).casefold()
+    return any(
+        re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", text) is not None for marker in markers
+    )
 
 
 def _extract_text(data: bytes, name: str, media_type: str) -> ExtractedDocument:

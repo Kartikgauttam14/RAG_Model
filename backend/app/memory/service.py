@@ -87,6 +87,7 @@ class MemoryService:
             temperature=0,
             max_tokens=500,
             response_format="json",
+            model=self.settings.llm_fast_model,
         )
         payload = _parse_json(result.text)
         stored = []

@@ -70,7 +70,14 @@ async def _index_document(job_id: uuid.UUID) -> dict[str, int | str]:
         await db.commit()
         try:
             data = Path(version.storage_path).read_bytes()
-            extracted = extract_document(data, document.name, document.media_type)
+            extracted = extract_document(
+                data,
+                document.name,
+                document.media_type,
+                settings.ingestion_excluded_sheets,
+                settings.ingestion_workflow_columns,
+                settings.ingestion_unpublished_markers,
+            )
             if extracted.needs_ocr:
                 if settings.ocr_provider == "disabled":
                     raise RuntimeError("Scanned PDF requires a configured OCR provider")
@@ -114,9 +121,9 @@ async def _index_document(job_id: uuid.UUID) -> dict[str, int | str]:
                         category=version.extracted_metadata.get("category"),
                         tags=version.extracted_metadata.get("tags", []),
                         access_scope=document.access_scope,
-                        metadata_json=chunk.metadata,
+                        metadata_json={**chunk.metadata, "embedding_model": settings.embedding_model},
                         embedding=vector,
-                        search_vector=func.to_tsvector("simple", chunk.content),
+                        search_vector=func.to_tsvector(settings.lexical_text_search_config, chunk.content),
                     )
                 )
             version.extracted_metadata = {**version.extracted_metadata, **extracted.metadata}

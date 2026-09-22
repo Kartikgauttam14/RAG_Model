@@ -17,6 +17,10 @@ COPY backend/app ./app
 COPY migrations ./migrations
 COPY backend/alembic.ini ./alembic.ini
 COPY prompts ./prompts
+# `scripts/bootstrap_admin.py` creates the first administrator. It runs as a
+# one-off job (Render) or a one-off task (ECS) against the same image, so the
+# repository's scripts directory has to be inside the image as well.
+COPY scripts ./scripts
 RUN mkdir -p /app/uploads && chown -R app:app /app
 USER app
 EXPOSE 8000

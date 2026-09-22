@@ -1,0 +1,80 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored (see the root .gitignore:
+# add `*.tfvars` before committing if it is not already ignored) - it holds the provider token
+# and the first administrator's password.
+#
+# The two variables without defaults must be set: hf_token, hf_model, embedding_inference_url,
+# bootstrap_admin_email and bootstrap_admin_password.
+
+aws_region  = "eu-west-1"
+project     = "mansam-rag"
+environment = "prod"
+
+# ---------------------------------------------------------------------------------------
+# Models. Base URL only for the chat endpoint: the client appends /v1/chat/completions.
+# ---------------------------------------------------------------------------------------
+hf_inference_url = "https://router.huggingface.co"
+hf_model         = "meta-llama/Llama-3.1-8B-Instruct"
+# Optional: run the planner, verifier and memory extractor on a smaller served model.
+llm_fast_model   = ""
+llm_draft_model  = ""
+
+embedding_inference_url = "https://<your-tei-endpoint>/embed"
+embedding_model         = "intfloat/multilingual-e5-large"
+embedding_dimension     = 1024
+
+# No GPU on Fargate: leave the local cross-encoder behind, or point this at a hosted reranker.
+rerank_provider       = "disabled"
+rerank_inference_url  = ""
+
+# ---------------------------------------------------------------------------------------
+# Retrieval and ingestion behaviour
+# ---------------------------------------------------------------------------------------
+rag_verify_enabled     = true
+rerank_top_k           = 8
+rate_limit_per_minute  = 30
+max_upload_size_mb     = 25
+
+# Keep internal tabs and draft rows out of the index - set these BEFORE loading the SSOT
+# workbook, because they apply at ingestion time.
+ingestion_excluded_sheets = "Changelog,DB Schema"
+
+# ---------------------------------------------------------------------------------------
+# Size. Start small: every one of these can be raised later, and RDS/EFS storage only grows.
+# ---------------------------------------------------------------------------------------
+api_cpu              = 512
+api_memory           = 1024
+api_desired_count    = 1
+api_min_capacity     = 1
+api_max_capacity     = 3
+worker_cpu           = 512
+worker_memory        = 1024
+worker_desired_count = 1
+worker_use_spot      = false
+
+db_instance_class        = "db.t4g.micro"
+db_allocated_storage     = 20
+db_backup_retention_days = 7
+db_multi_az              = false
+
+redis_node_type = "cache.t4g.micro"
+
+log_retention_days       = 30
+enable_container_insights = false
+
+# ---------------------------------------------------------------------------------------
+# Domain and alerting (all optional). Frontend certificates MUST live in us-east-1.
+# ---------------------------------------------------------------------------------------
+domain_name             = "api.example.com"
+certificate_arn         = "arn:aws:acm:eu-west-1:<account>:certificate/<id>"
+frontend_domain_name    = "rag.example.com"
+frontend_certificate_arn = "arn:aws:acm:us-east-1:<account>:certificate/<id>"
+route53_zone_id         = "Z0EXAMPLEZONEID"
+
+alert_email = "ops@example.com"
+
+# ---------------------------------------------------------------------------------------
+# Secrets. Do not commit this file.
+# ---------------------------------------------------------------------------------------
+hf_token                 = "hf_..."
+bootstrap_admin_email    = "admin@example.com"
+bootstrap_admin_password = "<at-least-12-characters>"

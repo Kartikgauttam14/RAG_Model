@@ -9,7 +9,14 @@ from app.embeddings import HuggingFaceEmbeddingProvider
 from app.llm import HuggingFaceLLMProvider
 from app.rag.prompts import PromptRepository
 from app.reranking import HuggingFaceReranker
-from app.speech import HuggingFaceSTTProvider, HuggingFaceTTSProvider
+from app.speech import (
+    HuggingFaceSTTProvider,
+    HuggingFaceTTSProvider,
+    OpenAICompatibleSTTProvider,
+    OpenAICompatibleTTSProvider,
+    SpeechToTextProvider,
+    TextToSpeechProvider,
+)
 
 
 @lru_cache
@@ -61,8 +68,10 @@ def get_reranker(
 
 def get_stt(
     settings: Settings = Depends(get_settings), client: httpx.AsyncClient = Depends(get_http_client)
-) -> HuggingFaceSTTProvider:
+) -> SpeechToTextProvider:
     try:
+        if settings.stt_provider == "openai":
+            return OpenAICompatibleSTTProvider(settings, client)
         return HuggingFaceSTTProvider(settings, client)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail="Speech recognition is not configured") from exc
@@ -70,8 +79,10 @@ def get_stt(
 
 def get_tts(
     settings: Settings = Depends(get_settings), client: httpx.AsyncClient = Depends(get_http_client)
-) -> HuggingFaceTTSProvider:
+) -> TextToSpeechProvider:
     try:
+        if settings.tts_provider == "openai":
+            return OpenAICompatibleTTSProvider(settings, client)
         return HuggingFaceTTSProvider(settings, client)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail="Speech synthesis is not configured") from exc

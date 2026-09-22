@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from app.llm import LLMMessage, LLMProvider, LLMUnavailableError
+from app.rag.counts import count_fields, is_count_question
 from app.rag.prompts import PromptRepository
 from app.retrieval import RetrievedEvidence
 from app.security import assess_prompt_injection, wrap_untrusted_evidence
@@ -12,6 +13,56 @@ UNCERTAINTY = {
     "ar": "لم أجد معلومات موثوقة كافية في قاعدة المعرفة المتاحة للإجابة بثقة.",
 }
 
+# The JSON contract is also stated in the prompt files, but those arrive as *leading*
+# system messages followed by a large evidence payload. Smaller instruction-tuned models
+# then continue the shape of the evidence (a JSON array/object of chunks) instead of
+# emitting the contract, which surfaced as "Draft answer is empty". Restating the contract
+# as the final key of the user payload keeps it last in the context window.
+ANSWER_CONTRACT = (
+    "Reply with exactly one JSON object and nothing else. It must contain the keys "
+    "'answer' (string), 'citation_ids' (array of integers), 'grounded' (boolean) and "
+    "'conflicts' (array of strings). Begin your reply with {\"answer\": and emit no other "
+    "top-level key. Never repeat, summarise or continue the evidence, and never return an "
+    "array at the top level."
+)
+
+VERIFICATION_CONTRACT = (
+    "Reply with exactly one JSON object and nothing else. It must contain the keys "
+    "'supported' (boolean), 'answered_question' (boolean), 'unsupported_claims' (array of "
+    "strings), 'citation_errors' (array of strings), 'contradictions' (array of strings), "
+    "'recommended_action' (one of \"accept\", \"regenerate\" or \"refuse\") and "
+    "'confidence' (number between 0 and 1). Begin your reply with {\"supported\": and emit "
+    "no other top-level key. Never repeat, summarise or continue the evidence."
+)
+
+# The verifier is sent the same evidence as the draft plus the cited sources, so a full
+# second copy of every chunk made verification the slowest call in the pipeline. Only the
+# chunks a claim actually cites need their full text: a spreadsheet row can be thousands of
+# characters wide, and truncating it hid the very field under verification (the Mamlakati
+# price sits at character 1552, so a 700-character cap made a correct answer look
+# unsupported). Uncited evidence is summarised, cited evidence is nearly whole.
+VERIFY_CHUNK_CHARS = 700
+VERIFY_CITED_CHARS = 3000
+
+
+def _authoritative_counts(evidence: list[RetrievedEvidence], question: str) -> list[dict[str, Any]]:
+    """Recorded count fields for a counting question, tagged with their evidence block.
+
+    The patterns live in ``app.rag.counts`` because the retriever fetches the same rows
+    directly; this only adds the 1-based evidence index the draft has to cite.
+    """
+    if not is_count_question(question):
+        return []
+    counts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(evidence, 1):
+        for field in count_fields(item.content):
+            if field["key"] in seen:
+                continue
+            seen.add(field["key"])
+            counts.append({**field, "evidence_index": index})
+    return counts
+
 
 class GroundedAnswerService:
     def __init__(
@@ -21,19 +72,27 @@ class GroundedAnswerService:
         min_score: float,
         min_evidence: int,
         max_context_chars: int,
+        *,
+        draft_model: str | None = None,
+        fast_model: str | None = None,
+        verify_enabled: bool = True,
     ) -> None:
         self.llm = llm
         self.prompts = prompts
         self.min_score = min_score
         self.min_evidence = min_evidence
         self.max_context_chars = max_context_chars
+        self.draft_model = draft_model
+        self.fast_model = fast_model
+        self.verify_enabled = verify_enabled
 
     async def answer(self, *, question: str, language: str, evidence: list[RetrievedEvidence]) -> GroundedAnswer:
         accepted = [item for item in evidence if _quality_score(item) >= self.min_score]
         if len(accepted) < self.min_evidence:
             return self._refusal(language, "insufficient_evidence")
         accepted = _fit_context(accepted, self.max_context_chars)
-        draft = await self._draft(question, language, accepted, strict=False)
+        counts = _authoritative_counts(accepted, question)
+        draft = await self._draft(question, language, accepted, strict=False, counts=counts)
         if not draft["grounded"]:
             return self._refusal(language, "model_reported_insufficient_evidence")
         citations, citation_errors = _resolve_citations(draft["citation_ids"], accepted)
@@ -42,6 +101,23 @@ class GroundedAnswerService:
             # retrieved chunk so the answer can still be delivered and audited.
             citations = _build_citations([str(accepted[0].chunk_id)], accepted)
             citation_errors = []
+        if not self.verify_enabled:
+            # Latency-budgeted path: the draft already cleared the admission gate, reported
+            # itself grounded and its citations resolve, so the second generation is skipped.
+            # Confidence is derived from retrieval quality instead of a verifier verdict and
+            # the status records that no independent check ran.
+            retrieval_confidence = sum(_quality_score(item) for item in accepted[:3]) / min(3, len(accepted))
+            confidence = max(0.0, min(0.75, 0.6 * retrieval_confidence + 0.4 * 1.0))
+            if citation_errors:
+                confidence = min(confidence, 0.4)
+            return GroundedAnswer(
+                answer=draft["answer"],
+                confidence=round(confidence, 3),
+                citations=citations,
+                grounded=True,
+                verification_status="verification_skipped",
+                conflicts=[*draft["conflicts"]],
+            )
         verification = await self._verify(question, draft["answer"], citations, accepted)
         if citation_errors:
             verification = VerificationResult(
@@ -54,7 +130,7 @@ class GroundedAnswerService:
                 confidence=min(verification.confidence, 0.5),
             )
         if not verification.supported or verification.recommended_action != "accept":
-            regenerated = await self._draft(question, language, accepted, strict=True)
+            regenerated = await self._draft(question, language, accepted, strict=True, counts=counts)
             if not regenerated["grounded"]:
                 return self._best_effort(regenerated["answer"], citations, accepted, "unverified_fallback")
             reg_citations, _reg_errors = _resolve_citations(regenerated["citation_ids"], accepted)
@@ -104,6 +180,7 @@ class GroundedAnswerService:
         evidence: list[RetrievedEvidence],
         *,
         strict: bool,
+        counts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         context = _render_evidence(evidence)
         strict_note = (
@@ -111,27 +188,34 @@ class GroundedAnswerService:
             if strict
             else ""
         )
+        contract = ANSWER_CONTRACT
+        if counts:
+            contract = (
+                f"{ANSWER_CONTRACT} The payload also carries 'authoritative_counts', the recorded "
+                "count fields. For a counting question answer with the 'value' of the entry whose "
+                "'description' matches the question's scope, exactly as written, and cite its "
+                "'evidence_index'. Never count evidence rows yourself."
+            )
         try:
+            request_payload: dict[str, Any] = {
+                "question": question,
+                "response_language": language,
+                "strict_note": strict_note,
+                "evidence": context,
+                "output_contract": contract,
+            }
+            if counts:
+                request_payload["authoritative_counts"] = counts
             result = await self.llm.generate(
                 [
                     LLMMessage("system", self.prompts.load("system/core.md")),
                     LLMMessage("system", self.prompts.load("answer_generation/grounded.md")),
-                    LLMMessage(
-                        "user",
-                        json.dumps(
-                            {
-                                "question": question,
-                                "response_language": language,
-                                "strict_note": strict_note,
-                                "evidence": context,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    ),
+                    LLMMessage("user", json.dumps(request_payload, ensure_ascii=False)),
                 ],
                 temperature=0,
                 max_tokens=1000,
                 response_format="json",
+                model=self.draft_model,
             )
             payload = _parse_json(result.text)
             answer = str(payload.get("answer", "")).strip()
@@ -155,33 +239,31 @@ class GroundedAnswerService:
         citations: list[Citation],
         evidence: list[RetrievedEvidence],
     ) -> VerificationResult:
+        cited_ids = frozenset(str(citation.chunk_id) for citation in citations)
+        request_payload = {
+            "question": question,
+            "draft_answer": answer,
+            "cited_sources": [
+                {
+                    "chunk_id": citation.chunk_id,
+                    "document": citation.document_name,
+                    "excerpt": citation.excerpt,
+                }
+                for citation in citations
+            ],
+            "evidence": _render_evidence(evidence, VERIFY_CHUNK_CHARS, cited_ids),
+            "output_contract": VERIFICATION_CONTRACT,
+        }
         result = await self.llm.generate(
             [
                 LLMMessage("system", self.prompts.load("system/core.md")),
                 LLMMessage("system", self.prompts.load("verification/evidence_check.md")),
-                LLMMessage(
-                    "user",
-                    json.dumps(
-                        {
-                            "question": question,
-                            "draft_answer": answer,
-                            "cited_sources": [
-                                {
-                                    "chunk_id": citation.chunk_id,
-                                    "document": citation.document_name,
-                                    "excerpt": citation.excerpt,
-                                }
-                                for citation in citations
-                            ],
-                            "evidence": _render_evidence(evidence),
-                        },
-                        ensure_ascii=False,
-                    ),
-                ),
+                LLMMessage("user", json.dumps(request_payload, ensure_ascii=False)),
             ],
             temperature=0,
             max_tokens=700,
             response_format="json",
+            model=self.fast_model,
         )
         payload = _parse_json(result.text)
         action = str(payload.get("recommended_action", "refuse"))
@@ -227,8 +309,15 @@ class GroundedAnswerService:
 
 
 def _quality_score(item: RetrievedEvidence) -> float:
-    if item.reranker_score is not None:
-        return max(0.0, min(1.0, item.reranker_score))
+    """Admission score that is compared against ``rag_min_score``.
+
+    The reranker score is deliberately excluded. Cross-encoder rerankers return an
+    uncalibrated relevance probability whose scale does not match the cosine
+    similarity that ``rag_min_score`` is tuned for (a relevant pair scores ~0.9
+    while an unrelated pair scores ~0.0001), so the retriever already uses it for
+    ordering. Feeding it into this gate rejects every candidate as soon as a
+    reranker is configured, which surfaces as ``insufficient_evidence``.
+    """
     if item.vector_score is not None:
         return max(0.0, min(1.0, item.vector_score))
     return max(0.0, min(1.0, item.lexical_score or 0.0))
@@ -245,7 +334,12 @@ def _fit_context(evidence: list[RetrievedEvidence], max_chars: int) -> list[Retr
     return selected
 
 
-def _render_evidence(evidence: list[RetrievedEvidence]) -> str:
+def _render_evidence(
+    evidence: list[RetrievedEvidence],
+    max_chars_per_chunk: int | None = None,
+    cited_ids: frozenset[str] = frozenset(),
+    cited_chars: int = VERIFY_CITED_CHARS,
+) -> str:
     blocks = []
     for index, item in enumerate(evidence, 1):
         assessment = assess_prompt_injection(item.content)
@@ -261,7 +355,11 @@ def _render_evidence(evidence: list[RetrievedEvidence]) -> str:
             },
             ensure_ascii=False,
         )
-        blocks.append(f"{header}\n{wrap_untrusted_evidence(item.content, str(item.chunk_id))}")
+        content = item.content
+        limit = cited_chars if str(item.chunk_id) in cited_ids else max_chars_per_chunk
+        if limit is not None and len(content) > limit:
+            content = content[:limit]
+        blocks.append(f"{header}\n{wrap_untrusted_evidence(content, str(item.chunk_id))}")
     return "\n\n".join(blocks)
 
 

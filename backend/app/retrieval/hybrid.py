@@ -1,14 +1,21 @@
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Document, DocumentChunk, DocumentStatus, DocumentVersion
-from app.embeddings import EmbeddingProvider
+from app.embeddings import EmbeddingProvider, EmbeddingUnavailableError
+from app.monitoring.logging import get_logger
+from app.rag.counts import is_count_question
 from app.reranking import Reranker, RerankerUnavailableError, RerankItem
+
+logger = get_logger(__name__)
+
+DEFAULT_LEXICAL_CONFIG = "english"
 
 
 @dataclass(frozen=True)
@@ -45,12 +52,14 @@ class HybridRetriever:
         vector_top_k: int,
         lexical_top_k: int,
         rerank_top_k: int,
+        lexical_config: str = DEFAULT_LEXICAL_CONFIG,
     ) -> None:
         self.embedding_provider = embedding_provider
         self.reranker = reranker
         self.vector_top_k = vector_top_k
         self.lexical_top_k = lexical_top_k
         self.rerank_top_k = rerank_top_k
+        self.lexical_config = lexical_config
 
     async def retrieve(
         self,
@@ -63,14 +72,29 @@ class HybridRetriever:
         filters: dict[str, Any] | None = None,
     ) -> RetrievalResult:
         started = time.perf_counter()
-        query_embedding = await self.embedding_provider.embed_query(query)
+        vector_rows: list[Any] = []
+        fallback_reason: str | None = None
+        try:
+            query_embedding = await self.embedding_provider.embed_query(query)
+        except EmbeddingUnavailableError:
+            # The vector arm needs the embedding endpoint; the lexical arm does not. Degrading
+            # to full-text search keeps questions answerable when that endpoint is down or
+            # cannot load its model, at the cost of recall on paraphrased questions.
+            logger.warning("embedding_unavailable_lexical_only", query_chars=len(query))
+            query_embedding = None
+            fallback_reason = "embedding_unavailable_lexical_only"
         base_filters = self._filters(tenant_id, user_id, role, filters or {})
 
-        vector_score = (1 - DocumentChunk.embedding.cosine_distance(query_embedding)).label("vector_score")
-        vector_stmt = (
-            self._base_select(vector_score).where(*base_filters).order_by(vector_score.desc()).limit(self.vector_top_k)
-        )
-        ts_query = func.websearch_to_tsquery("simple", query)
+        if query_embedding is not None:
+            vector_score = (1 - DocumentChunk.embedding.cosine_distance(query_embedding)).label("vector_score")
+            vector_stmt = (
+                self._base_select(vector_score)
+                .where(*base_filters)
+                .order_by(vector_score.desc())
+                .limit(self.vector_top_k)
+            )
+            vector_rows = list((await db.execute(vector_stmt)).all())
+        ts_query = self._lexical_tsquery(query)
         lexical_score = func.ts_rank_cd(DocumentChunk.search_vector, ts_query).label("lexical_score")
         lexical_stmt = (
             self._base_select(lexical_score)
@@ -78,13 +102,11 @@ class HybridRetriever:
             .order_by(lexical_score.desc())
             .limit(self.lexical_top_k)
         )
-        vector_rows = list((await db.execute(vector_stmt)).all())
         lexical_rows = list((await db.execute(lexical_stmt)).all())
         merged = self._rrf_merge(vector_rows, lexical_rows)
         candidate_chunk_ids = [item.chunk_id for item in merged]
 
         reranker_used = False
-        fallback_reason: str | None = None
         if self.reranker and merged:
             try:
                 ranking = await self.reranker.rerank(
@@ -100,12 +122,14 @@ class HybridRetriever:
                 ]
                 reranker_used = True
             except RerankerUnavailableError:
-                fallback_reason = "reranker_unavailable_rrf_used"
+                # A missing embedding provider is the more fundamental degradation, so it
+                # keeps the reason when both stages fail.
+                fallback_reason = fallback_reason or "reranker_unavailable_rrf_used"
                 merged = merged[: self.rerank_top_k]
         else:
             merged = merged[: self.rerank_top_k]
             if self.reranker is None:
-                fallback_reason = "reranker_not_configured_rrf_used"
+                fallback_reason = fallback_reason or "reranker_not_configured_rrf_used"
 
         return RetrievalResult(
             evidence=merged,
@@ -120,6 +144,39 @@ class HybridRetriever:
                 "candidate_chunk_ids": [str(item) for item in candidate_chunk_ids],
             },
         )
+
+    async def count_evidence(
+        self,
+        db: AsyncSession,
+        *,
+        query: str,
+        tenant_id: str,
+        user_id: uuid.UUID,
+        role: str,
+    ) -> list[RetrievedEvidence]:
+        """Fetch the recorded count fields when the question asks how many.
+
+        A row such as ``Setting Key: boutique_count_ksa / Value: 6`` answers the question
+        exactly, but it competes for the top-k with dozens of neighbouring rows and was measured
+        to be missing from the retrieved set, which left the model tallying rows and answering
+        4, 6 and "five" on different runs. Counting questions read the count rows directly,
+        under the same visibility filters as retrieval.
+        """
+        if not is_count_question(query):
+            return []
+        stmt = (
+            self._base_select(literal(1.0))
+            .where(
+                *self._filters(tenant_id, user_id, role, {}),
+                DocumentChunk.content.op("~*")("Setting Key: [a-z_]*_count_[a-z_]*"),
+            )
+            .limit(2)
+        )
+        rows = list((await db.execute(stmt)).all())
+        if not rows:
+            logger.info("count_fields_not_found", query_chars=len(query))
+            return []
+        return self._rrf_merge([], rows)
 
     @staticmethod
     def _base_select(score: Any) -> Select[Any]:
@@ -138,6 +195,20 @@ class HybridRetriever:
                 DocumentVersion.version == Document.current_version,
             )
         )
+
+    def _lexical_tsquery(self, query: str) -> Any:
+        """Build an OR-based full text query so the lexical arm matches any term.
+
+        ``websearch_to_tsquery`` interprets space separated words as an AND that
+        includes stop words, so a natural language question only matches a chunk
+        containing every word verbatim. Joining the extracted terms with the ``or``
+        operator restores recall, and the text search configuration is shared with
+        the indexed ``search_vector`` so both sides use the same lexemes.
+        """
+        terms = re.findall(r"\w+", query, flags=re.UNICODE)
+        if not terms:
+            return func.websearch_to_tsquery(self.lexical_config, query)
+        return func.websearch_to_tsquery(self.lexical_config, " or ".join(terms))
 
     @staticmethod
     def _filters(

@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 
@@ -11,7 +12,9 @@ from structlog.contextvars import bind_contextvars, clear_contextvars
 from app.api import api_router
 from app.api.routes.health import router as health_router
 from app.config import get_settings
-from app.dependencies import get_redis
+from app.dependencies import get_http_client, get_redis
+from app.embeddings import HuggingFaceEmbeddingProvider
+from app.llm import HuggingFaceLLMProvider, LLMMessage
 from app.monitoring.logging import configure_logging, get_logger
 from app.monitoring.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
@@ -40,6 +43,61 @@ app.include_router(api_router, prefix=settings.api_prefix)
 @app.on_event("startup")
 async def validate_configuration() -> None:
     settings.validate_runtime()
+    if settings.keep_model_warm:
+        app.state.warmup_task = asyncio.create_task(_keep_model_warm())
+
+
+@app.on_event("shutdown")
+async def stop_background_tasks() -> None:
+    task = getattr(app.state, "warmup_task", None)
+    if task is not None:
+        task.cancel()
+
+
+async def _keep_model_warm() -> None:
+    """Hold the answer model and the embedding model in memory.
+
+    Ollama unloads a model after five minutes of inactivity, and neither a per-request
+    ``keep_alive`` nor the ``OLLAMA_KEEP_ALIVE`` variable changes that through its
+    OpenAI-compatible endpoint (both were measured). Warming only the answer model was not
+    enough: on a 6 GB GPU the first retrieval then had to load the embedding model next to a
+    model already holding the card, and that load failed - reproducibly in the seconds after
+    startup and not once the card had settled. Each tick therefore warms both, retries a few
+    times with a short backoff, and costs a few hundred milliseconds when it succeeds.
+    """
+    if not settings.hf_inference_url:
+        logger.info("model_warmup_skipped", reason="no LLM endpoint configured")
+        return
+    while True:
+        await _warm_models()
+        await asyncio.sleep(settings.keep_warm_interval_seconds)
+
+
+async def _warm_models(attempts: int = 3, retry_seconds: int = 15) -> None:
+    for attempt in range(1, attempts + 1):
+        failures: list[str] = []
+        try:
+            llm = HuggingFaceLLMProvider(settings, get_http_client())
+            await llm.generate([LLMMessage("user", "Reply with the single word: ok")], max_tokens=1)
+        except Exception as exc:
+            failures.append(f"llm:{type(exc).__name__}:{exc}")
+        if settings.embedding_inference_url:
+            try:
+                embeddings = HuggingFaceEmbeddingProvider(settings, get_http_client())
+                await embeddings.embed_query("warm")
+            except Exception as exc:
+                failures.append(f"embedding:{type(exc).__name__}:{exc}")
+        if not failures:
+            logger.info(
+                "models_kept_warm",
+                model=settings.hf_model,
+                embedding_model=settings.embedding_model,
+                interval_seconds=settings.keep_warm_interval_seconds,
+            )
+            return
+        logger.warning("model_warmup_failed", attempt=attempt, attempts=attempts, failures=failures)
+        if attempt < attempts:
+            await asyncio.sleep(retry_seconds)
 
 
 @app.middleware("http")
@@ -98,6 +156,9 @@ async def request_context(request: Request, call_next):
         path=path,
         status=response.status_code,
         duration_ms=int(duration * 1000),
+        # "direct" identifies a script or curl; a browser sends its origin, which makes it
+        # possible to tell a slow UI apart from a slow pipeline when reading this log.
+        caller=request.headers.get("origin", "direct"),
     )
     return response
 

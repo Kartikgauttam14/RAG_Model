@@ -92,7 +92,7 @@ class Message(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     input_type: Mapped[str] = mapped_column(String(16), default="text")
     confidence: Mapped[float | None] = mapped_column(Float)
     citations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
-    verification_status: Mapped[str | None] = mapped_column(String(32))
+    verification_status: Mapped[str | None] = mapped_column(String(64))
     request_id: Mapped[str | None] = mapped_column(String(64), index=True)
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
@@ -203,7 +203,7 @@ class AnswerVerification(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     request_id: Mapped[str] = mapped_column(String(64), index=True)
     message_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id"))
     grounded: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), index=True)
+    status: Mapped[str] = mapped_column(String(64), index=True)
     confidence: Mapped[float] = mapped_column(Float)
     unsupported_claims: Mapped[list[str]] = mapped_column(JSON, default=list)
     citation_errors: Mapped[list[str]] = mapped_column(JSON, default=list)

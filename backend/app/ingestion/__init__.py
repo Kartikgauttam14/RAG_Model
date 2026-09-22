@@ -1,6 +1,6 @@
 from app.ingestion.chunking import StructureAwareChunker
 from app.ingestion.extractors import ExtractionError, extract_document
-from app.ingestion.normalize import normalize_text, remove_repeated_page_furniture
+from app.ingestion.normalize import normalize_text, remove_page_folios, remove_repeated_page_furniture
 from app.ingestion.sites import (
     INGESTIBLE_CONTENT_TYPES,
     SITEMAP_PATHS,
@@ -32,6 +32,7 @@ __all__ = [
     "normalize_site_paths",
     "normalize_text",
     "parse_sitemap_urls",
+    "remove_page_folios",
     "remove_repeated_page_furniture",
     "source_document_name",
 ]
