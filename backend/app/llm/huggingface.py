@@ -131,4 +131,14 @@ class HuggingFaceLLMProvider:
                 raise LLMUnavailableError("Hugging Face endpoint returned no generated text")
             return LLMResult(text=text, model=selected)
         except (httpx.TimeoutException, httpx.HTTPError, KeyError, IndexError, TypeError) as exc:
-            raise LLMUnavailableError("Hosted language model is unavailable") from exc
+            error_details = str(exc)
+            if isinstance(exc, httpx.HTTPStatusError):
+                error_details = f"{exc} | Response: {exc.response.text}"
+            logger.error(
+                "llm_request_failed",
+                endpoint=self.endpoint,
+                model=selected,
+                error=error_details,
+            )
+            raise LLMUnavailableError(f"Hosted language model is unavailable: {error_details}") from exc
+
