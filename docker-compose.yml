@@ -71,6 +71,20 @@ services:
       retries: 10
       start_period: 60s
 
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/collections || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   backend:
     build:
       context: .
@@ -124,4 +138,5 @@ volumes:
   redis_data:
   reranker_data:
   speech_models:
+  qdrant_data:
 

@@ -84,16 +84,21 @@ export async function streamChat(
       state?: string;
       data?: ChatAnswer;
       error?: string;
+      reason?: string;
+      detail?: string;
     };
     if (event.type === "status" && event.state) onStage(event.state);
     else if (event.type === "answer" && event.data) answer = event.data;
     else if (event.type === "error") {
       // Name the failure instead of a generic string: "The request failed" alone gave no
-      // way to tell a provider outage from a rejected answer.
+      // way to tell a provider outage from a rejected answer. The backend now sends a
+      // per-cause `detail` (and machine `reason`); prefer it, keep the legacy mapping.
       throw new Error(
-        event.error === "service_unavailable"
-          ? "The language model is unavailable right now — please try again."
-          : "The assistant could not produce an answer from the knowledge base — please try again.",
+        typeof event.detail === "string" && event.detail.length > 0
+          ? event.detail
+          : event.error === "service_unavailable"
+            ? "The language model is unavailable right now — please try again."
+            : "The assistant could not produce an answer from the knowledge base — please try again.",
       );
     }
   };

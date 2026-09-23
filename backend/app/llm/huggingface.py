@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -10,9 +10,27 @@ from app.monitoring.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Short machine-readable cause attached to every LLMUnavailableError so the
+# API layer can tell the user *why* generation failed instead of one generic
+# "language model is unavailable". Render deployments fail most often on
+# unreachable_endpoint (localhost Ollama URL copied to the cloud) and
+# model_not_found (Ollama tag instead of a provider model id).
+LLMFailureReason = Literal[
+    "unreachable_endpoint",
+    "unauthorized",
+    "quota_exhausted",
+    "model_not_found",
+    "rate_limited",
+    "provider_error",
+    "timeout",
+    "empty_completion",
+]
+
 
 class LLMUnavailableError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, reason: LLMFailureReason = "provider_error") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class HuggingFaceLLMProvider:
@@ -49,8 +67,8 @@ class HuggingFaceLLMProvider:
                     response_format=response_format,
                     model=selected,
                 )
-            except LLMUnavailableError:
-                if attempt == 2:
+            except LLMUnavailableError as exc:
+                if attempt == 2 or not _retryable(exc.reason):
                     raise
                 await asyncio.sleep(0.5 * (2**attempt))
         raise LLMUnavailableError("Hosted language model is unavailable")
@@ -99,7 +117,9 @@ class HuggingFaceLLMProvider:
                 )
                 text = body["choices"][0]["message"]["content"]
                 if not isinstance(text, str) or not text.strip():
-                    raise LLMUnavailableError("Hugging Face endpoint returned no generated text")
+                    raise LLMUnavailableError(
+                        "Hugging Face endpoint returned no generated text", reason="empty_completion"
+                    )
                 return LLMResult(
                     text=text,
                     model=body.get("model", selected),
@@ -128,17 +148,91 @@ class HuggingFaceLLMProvider:
             else:
                 text = body.get("generated_text", "")
             if not text:
-                raise LLMUnavailableError("Hugging Face endpoint returned no generated text")
+                raise LLMUnavailableError("Hugging Face endpoint returned no generated text", reason="empty_completion")
             return LLMResult(text=text, model=selected)
-        except (httpx.TimeoutException, httpx.HTTPError, KeyError, IndexError, TypeError) as exc:
-            error_details = str(exc)
-            if isinstance(exc, httpx.HTTPStatusError):
-                error_details = f"{exc} | Response: {exc.response.text}"
-            logger.error(
+        except LLMUnavailableError:
+            raise
+        except httpx.TimeoutException as exc:
+            logger.warning(
                 "llm_request_failed",
                 endpoint=self.endpoint,
                 model=selected,
-                error=error_details,
+                reason="timeout",
+                error=str(exc),
             )
-            raise LLMUnavailableError(f"Hosted language model is unavailable: {error_details}") from exc
+            raise LLMUnavailableError(
+                f"Language model timed out after {self.settings.llm_timeout_seconds}s "
+                f"({self.endpoint}). The hosted model may be cold-loading; try again.",
+                reason="timeout",
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            reason, hint = _classify_status(exc.response.status_code, exc.response.text)
+            logger.warning(
+                "llm_request_failed",
+                endpoint=self.endpoint,
+                model=selected,
+                reason=reason,
+                status_code=exc.response.status_code,
+                error=exc.response.text[:2000],
+            )
+            raise LLMUnavailableError(
+                f"Language model request failed ({exc.response.status_code}): {hint}",
+                reason=reason,
+            ) from exc
+        except (httpx.HTTPError, KeyError, IndexError, TypeError) as exc:
+            logger.warning(
+                "llm_request_failed",
+                endpoint=self.endpoint,
+                model=selected,
+                reason="unreachable_endpoint",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise LLMUnavailableError(
+                f"Language model endpoint is unreachable ({self.endpoint}). "
+                "On Render this usually means a localhost Ollama URL was copied "
+                "to the cloud — set HF_INFERENCE_URL to the hosted base URL.",
+                reason="unreachable_endpoint",
+            ) from exc
 
+
+def _retryable(reason: LLMFailureReason) -> bool:
+    """Only transient failures deserve a retry: 5xx, timeouts and rate limits.
+
+    Auth/quota/model-id failures are deterministic — retrying the same request
+    three times just triples the wait before the user sees the real cause.
+    """
+    return reason in {"provider_error", "timeout", "rate_limited"}
+
+
+def _classify_status(status_code: int, body: str) -> tuple[LLMFailureReason, str]:
+    """Map an HTTP failure to a machine reason plus an actionable hint."""
+    lowered = (body or "").lower()
+    if status_code == 401 or status_code == 403:
+        return (
+            "unauthorized",
+            "the endpoint rejected the credentials — check HF_TOKEN (access, not expired).",
+        )
+    if status_code == 402 or "quota" in lowered or "credit" in lowered or "payment" in lowered:
+        return (
+            "quota_exhausted",
+            "the provider reports no remaining credit — check billing/quota, then retry.",
+        )
+    if status_code == 404 or ("model" in lowered and "not found" in lowered):
+        return (
+            "model_not_found",
+            "the model id is not served at this URL — check HF_MODEL "
+            "(an Ollama tag like gemma3:4b won't work on Render; "
+            "use e.g. meta-llama/Llama-3.1-8B-Instruct).",
+        )
+    if status_code == 429:
+        return (
+            "rate_limited",
+            "the provider throttled the request — wait a minute and retry.",
+        )
+    if 500 <= status_code < 600:
+        return (
+            "provider_error",
+            "the provider returned a server error — usually transient, retry shortly.",
+        )
+    return ("provider_error", f"unexpected status {status_code}: {body[:500]}")

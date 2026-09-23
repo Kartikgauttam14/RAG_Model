@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     llm_provider: str = "huggingface"
     hf_token: str | None = None
-    hf_model: str = "buckets/kartikgauttam14/Spark-X2.5-4B-bucket"
+    hf_model: str = "meta-llama/llama-3.2-3b-instruct:free"
     hf_inference_url: str | None = None
     hf_api_mode: Literal["openai", "native"] = "openai"
     llm_timeout_seconds: float = 60
@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     rag_lexical_top_k: int = Field(20, ge=1, le=100)
     rerank_top_k: int = Field(8, ge=1, le=30)
     lexical_text_search_config: str = "english"
+    # Dense-index backend for the vector arm: "pgvector" (Postgres HNSW, the
+    # default) or "qdrant" (dedicated store, Postgres stays system of record).
+    vector_store_backend: Literal["pgvector", "qdrant"] = "pgvector"
+    qdrant_url: str | None = None
+    qdrant_api_key: str | None = None
+    qdrant_collection: str = "mansam_chunks"
+    qdrant_timeout_seconds: float = 10
+    qdrant_hnsw_m: int = Field(16, ge=4, le=64)
+    qdrant_hnsw_ef_construct: int = Field(128, ge=16, le=512)
+    qdrant_full_scan_threshold: int = Field(10000, ge=100, le=1000000)
+    qdrant_search_ef: int = Field(64, ge=8, le=512)
     rag_min_score: float = Field(0.35, ge=0, le=1)
     rag_min_evidence: int = Field(1, ge=1, le=10)
     rag_max_context_chars: int = Field(16000, ge=1000, le=100000)
@@ -181,6 +192,20 @@ class Settings(BaseSettings):
             missing = [name for name, value in required.items() if not value]
             if missing:
                 raise RuntimeError(f"Missing production configuration: {', '.join(missing)}")
+            # Warn if using a localhost URL in production (common when copying .env)
+            if self.hf_inference_url and any(
+                host in self.hf_inference_url.lower() for host in ("localhost", "127.0.0.1")
+            ):
+                import warnings
+
+                warnings.warn(
+                    "HF_INFERENCE_URL points to a localhost address - this will not "
+                    "work in production/cloud environments. "
+                    "Use a hosted endpoint like https://openrouter.ai/api/v1",
+                    stacklevel=2,
+                )
+        if self.vector_store_backend == "qdrant" and not self.qdrant_url:
+            raise RuntimeError("Missing production configuration: QDRANT_URL")
 
 
 @lru_cache

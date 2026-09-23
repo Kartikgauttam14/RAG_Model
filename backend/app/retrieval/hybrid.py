@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import Select, func, literal, or_, select
+from sqlalchemy import Select, String, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Document, DocumentChunk, DocumentStatus, DocumentVersion
@@ -12,6 +12,7 @@ from app.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from app.monitoring.logging import get_logger
 from app.rag.counts import is_count_question
 from app.reranking import Reranker, RerankerUnavailableError, RerankItem
+from app.vectorstore.base import VectorStore, VectorStoreUnavailableError
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,7 @@ class HybridRetriever:
         lexical_top_k: int,
         rerank_top_k: int,
         lexical_config: str = DEFAULT_LEXICAL_CONFIG,
+        vector_store: VectorStore | None = None,
     ) -> None:
         self.embedding_provider = embedding_provider
         self.reranker = reranker
@@ -60,6 +62,10 @@ class HybridRetriever:
         self.lexical_top_k = lexical_top_k
         self.rerank_top_k = rerank_top_k
         self.lexical_config = lexical_config
+        # Dedicated dense index (Qdrant). None means pgvector serves the
+        # vector arm via the SQL below; set means Qdrant is tried first with
+        # automatic fallback to pgvector on outage.
+        self.vector_store = vector_store
 
     async def retrieve(
         self,
@@ -86,14 +92,19 @@ class HybridRetriever:
         base_filters = self._filters(tenant_id, user_id, role, filters or {})
 
         if query_embedding is not None:
-            vector_score = (1 - DocumentChunk.embedding.cosine_distance(query_embedding)).label("vector_score")
-            vector_stmt = (
-                self._base_select(vector_score)
-                .where(*base_filters)
-                .order_by(vector_score.desc())
-                .limit(self.vector_top_k)
+            vector_rows = await self._vector_candidates(
+                db,
+                query_embedding=query_embedding,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                role=role,
+                top_k=self.vector_top_k,
             )
-            vector_rows = list((await db.execute(vector_stmt)).all())
+            if self._qdrant_active and not vector_rows:
+                # Qdrant answered but Postgres hydration found nothing visible
+                # (stale points, version drift): record it, pgvector stays off
+                # because Qdrant itself is healthy.
+                fallback_reason = fallback_reason or "qdrant_no_visible_candidates"
         ts_query = self._lexical_tsquery(query)
         lexical_score = func.ts_rank_cd(DocumentChunk.search_vector, ts_query).label("lexical_score")
         lexical_stmt = (
@@ -142,8 +153,97 @@ class HybridRetriever:
                 "lexical_candidates": len(lexical_rows),
                 "merged_candidates": len(merged),
                 "candidate_chunk_ids": [str(item) for item in candidate_chunk_ids],
+                "vector_backend": self._vector_backend_name(),
             },
         )
+
+    # -- vector arm ----------------------------------------------------
+
+    @property
+    def _qdrant_active(self) -> bool:
+        return self.vector_store is not None and getattr(self, "_qdrant_served", False)
+
+    def _vector_backend_name(self) -> str:
+        if self.vector_store is not None and getattr(self, "_qdrant_served", False):
+            return self.vector_store.backend_name
+        return "pgvector"
+
+    def _allowed_scopes(self, user_id: uuid.UUID, role: str) -> list[str]:
+        return ["public", "tenant", f"user:{user_id}", f"role:{role}"]
+
+    async def _vector_candidates(
+        self,
+        db: AsyncSession,
+        *,
+        query_embedding: list[float],
+        tenant_id: str,
+        user_id: uuid.UUID,
+        role: str,
+        top_k: int,
+    ) -> list[Any]:
+        """Vector-arm candidates: Qdrant first (with pgvector fallback), else pgvector."""
+        self._qdrant_served = False
+        if self.vector_store is not None:
+            try:
+                hits = await self.vector_store.search(
+                    query_embedding,
+                    limit=top_k,
+                    tenant_id=tenant_id,
+                    scopes=self._allowed_scopes(user_id, role),
+                )
+            except VectorStoreUnavailableError:
+                logger.warning("vector_store_unavailable_pgvector_fallback")
+            else:
+                rows = await self._hydrate_hits(db, hits)
+                self._qdrant_served = True
+                return rows
+        vector_score = (1 - DocumentChunk.embedding.cosine_distance(query_embedding)).label("vector_score")
+        vector_stmt = (
+            self._base_select(vector_score)
+            .where(*self._filters(tenant_id, user_id, role, {}))
+            .order_by(vector_score.desc())
+            .limit(top_k)
+        )
+        return list((await db.execute(vector_stmt)).all())
+
+    async def _hydrate_hits(self, db: AsyncSession, hits: list[Any]) -> list[Any]:
+        """Resolve Qdrant point ids to visible Postgres chunks.
+
+        The point id IS the Postgres chunk UUID, so hydration is a single
+        ``WHERE id IN`` query plus the same joins/visibility rules as the
+        pgvector arm. Qdrant scores are cosine similarities already; the RRF
+        merge only needs their rank order, so rows are ordered by hit rank.
+        """
+        chunk_ids: list[uuid.UUID] = []
+        scores: dict[uuid.UUID, float] = {}
+        for hit in hits:
+            try:
+                chunk_id = uuid.UUID(str(hit.point_id))
+            except ValueError:
+                continue
+            if chunk_id not in scores:
+                chunk_ids.append(chunk_id)
+                scores[chunk_id] = float(hit.score)
+        if not chunk_ids:
+            return []
+        score_label = literal(0.0).label("vector_score")
+        stmt = (
+            self._base_select(score_label)
+            .where(DocumentChunk.id.in_(chunk_ids))
+            .order_by(
+                func.array_position(
+                    [str(item) for item in chunk_ids],
+                    func.cast(DocumentChunk.id, String),
+                )
+            )
+        )
+        rows = list((await db.execute(stmt)).all())
+        hydrated: list[Any] = []
+        for row in rows:
+            chunk = row[0]
+            score = scores.get(chunk.id)
+            hydrated.append((chunk, row[1], row[2], score if score is not None else 0.0))
+        return hydrated
 
     async def count_evidence(
         self,

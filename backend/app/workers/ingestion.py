@@ -21,6 +21,8 @@ from app.embeddings import HuggingFaceEmbeddingProvider
 from app.ingestion import StructureAwareChunker, extract_document
 from app.ingestion.ocr import HTTPCloudOCRProvider
 from app.monitoring.logging import get_logger
+from app.vectorstore import QdrantVectorStore, VectorStoreUnavailableError, point_payload
+from app.vectorstore.base import VectorPoint
 from app.workers.celery_app import celery_app
 
 logger = get_logger(__name__)
@@ -105,9 +107,10 @@ async def _index_document(job_id: uuid.UUID) -> dict[str, int | str]:
                 job.progress = 0.40 + 0.45 * min(1, (start + len(batch)) / len(chunks))
                 await db.commit()
             await db.execute(delete(DocumentChunk).where(DocumentChunk.document_version_id == version.id))
+            stored: list[DocumentChunk] = []
             for chunk, vector in zip(chunks, vectors, strict=True):
                 language = _detect_language(chunk.content)
-                db.add(
+                stored.append(
                     DocumentChunk(
                         document_id=document.id,
                         document_version_id=version.id,
@@ -126,6 +129,13 @@ async def _index_document(job_id: uuid.UUID) -> dict[str, int | str]:
                         search_vector=func.to_tsvector(settings.lexical_text_search_config, chunk.content),
                     )
                 )
+            db.add_all(stored)
+            await db.flush()
+            # Dual-write the dense copy: Postgres rows flush first so chunk ids
+            # exist; Qdrant points are addressed by those ids. A Qdrant outage
+            # must not fail ingestion — Postgres stays queryable via pgvector
+            # and the next reindex repairs the Qdrant copy (delete+upsert).
+            await _mirror_to_vector_store(settings, version, stored, vectors)
             version.extracted_metadata = {**version.extracted_metadata, **extracted.metadata}
             document.status = DocumentStatus.ready
             job.status = JobStatus.completed
@@ -155,3 +165,49 @@ def _detect_language(text: str) -> str:
     arabic = len(ARABIC.findall(sample))
     letters = sum(character.isalpha() for character in sample)
     return "ar" if letters and arabic / letters > 0.3 else "en"
+
+
+async def _mirror_to_vector_store(
+    settings: Any,
+    version: DocumentVersion,
+    stored: list[DocumentChunk],
+    vectors: list[list[float]],
+) -> None:
+    """Dual-write chunk vectors to the dedicated dense index (best effort).
+
+    Postgres rows are flushed before this call, so every chunk has an id to
+    address its Qdrant point. The old version copy is deleted first so a
+    reindex never leaves stale points behind. Any outage is logged and
+    swallowed: ingestion still completes on Postgres/pgvector.
+    """
+    if settings.vector_store_backend != "qdrant" or not stored:
+        return
+    try:
+        store = QdrantVectorStore(settings)
+        await store.ensure_collection()
+        await store.delete_by_version(document_version_id=str(version.id))
+        await store.upsert(
+            [
+                VectorPoint(
+                    point_id=str(chunk.id),
+                    vector=vector,
+                    payload=point_payload(
+                        tenant_id=chunk.tenant_id,
+                        access_scope=chunk.access_scope,
+                        document_id=str(chunk.document_id),
+                        document_version_id=str(chunk.document_version_id),
+                        chunk_index=chunk.chunk_index,
+                        language=chunk.language,
+                        category=chunk.category,
+                        section=chunk.section,
+                        page_number=chunk.page_number,
+                        embedding_model=settings.embedding_model,
+                    ),
+                )
+                for chunk, vector in zip(stored, vectors, strict=True)
+            ]
+        )
+    except VectorStoreUnavailableError as exc:
+        logger.warning("vector_store_mirror_skipped", error=str(exc))
+    except Exception as exc:
+        logger.warning("vector_store_mirror_failed", error_type=type(exc).__name__)

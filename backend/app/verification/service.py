@@ -9,8 +9,8 @@ from app.security import assess_prompt_injection, wrap_untrusted_evidence
 from app.verification.models import Citation, GroundedAnswer, VerificationResult
 
 UNCERTAINTY = {
-    "en": "I couldn't find enough reliable information in the available knowledge base to answer that confidently.",
-    "ar": "لم أجد معلومات موثوقة كافية في قاعدة المعرفة المتاحة للإجابة بثقة.",
+    "en": "Let me find your perfect match — may I ask a couple of questions to guide us?",
+    "ar": "دعني أجد لك العطر المثالي — هل يمكنني أن أسألك بعض الأسئلة لأساعدك بشكل أفضل؟",
 }
 
 # The JSON contract is also stated in the prompt files, but those arrive as *leading*
@@ -23,7 +23,10 @@ ANSWER_CONTRACT = (
     "'answer' (string), 'citation_ids' (array of integers), 'grounded' (boolean) and "
     "'conflicts' (array of strings). Begin your reply with {\"answer\": and emit no other "
     "top-level key. Never repeat, summarise or continue the evidence, and never return an "
-    "array at the top level."
+    "array at the top level. "
+    "CRITICAL: Do NOT begin the answer with any welcome or greeting phrase such as "
+    "'Welcome to Mansam', 'It is a pleasure', 'Hello', 'Hi', or any similar opener. "
+    "The greeting was already sent. Go straight to the helpful response."
 )
 
 VERIFICATION_CONTRACT = (

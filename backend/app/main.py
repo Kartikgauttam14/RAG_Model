@@ -12,6 +12,7 @@ from structlog.contextvars import bind_contextvars, clear_contextvars
 from app.api import api_router
 from app.api.routes.health import router as health_router
 from app.config import get_settings
+from app.config.settings import Settings
 from app.dependencies import get_http_client, get_redis
 from app.embeddings import HuggingFaceEmbeddingProvider
 from app.llm import HuggingFaceLLMProvider, LLMMessage
@@ -59,6 +60,7 @@ async def root() -> dict[str, str]:
 @app.on_event("startup")
 async def validate_configuration() -> None:
     settings.validate_runtime()
+    _warn_loopback_model_urls(settings)
     if settings.keep_model_warm:
         app.state.warmup_task = asyncio.create_task(_keep_model_warm())
 
@@ -68,6 +70,28 @@ async def stop_background_tasks() -> None:
     task = getattr(app.state, "warmup_task", None)
     if task is not None:
         task.cancel()
+
+
+def _warn_loopback_model_urls(settings: Settings) -> None:
+    """Log a loud warning when model URLs point at this machine itself.
+
+    Localhost is correct for laptop development (Ollama) but is the #1 Render
+    failure: inside the container it resolves to the container, so every LLM
+    and embedding call fails as connection-refused. Non-fatal on purpose —
+    local dev legitimately uses these URLs.
+    """
+    loopback = ("localhost", "127.0.0.1", "::1")
+    for name, url in (
+        ("HF_INFERENCE_URL", settings.hf_inference_url),
+        ("EMBEDDING_INFERENCE_URL", settings.embedding_inference_url),
+    ):
+        if url and any(host in url.lower() for host in loopback):
+            logger.warning(
+                "loopback_model_url",
+                setting=name,
+                hint=f"{name} points at localhost, which is this container on Render — "
+                "use the hosted base URL in production.",
+            )
 
 
 async def _keep_model_warm() -> None:

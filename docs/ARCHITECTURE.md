@@ -2,7 +2,7 @@
 
 `Browser → FastAPI → query planner → hybrid retrieval → optional reranker → grounded generator → verifier → text/TTS`.
 
-PostgreSQL holds users, conversations, documents, versions, chunks, retrieval events, verification events, feedback and audit records. `pgvector` holds document and long-term-memory embeddings. Redis holds rate-limit counters and short-term conversation state. Celery performs asynchronous extraction, chunking, hosted embedding and indexing.
+PostgreSQL holds users, conversations, documents, versions, chunks, retrieval events, verification events, feedback and audit records. `pgvector` holds document and long-term-memory embeddings. Qdrant is an optional dedicated dense index alongside pgvector — see `docs/VECTOR-DB.md`. Redis holds rate-limit counters and short-term conversation state. Celery performs asynchronous extraction, chunking, hosted embedding and indexing.
 
 The Hugging Face Bucket URL in the project context is storage, not assumed to be an inference endpoint. `HF_INFERENCE_URL` selects a compatible hosted HF deployment; the provider interfaces make replacement possible without changing RAG business logic.
 

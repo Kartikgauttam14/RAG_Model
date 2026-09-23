@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -30,6 +31,35 @@ from app.verification import GroundedAnswer, GroundedAnswerService
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 logger = get_logger(__name__)
+
+# Short social openers that should receive a greeting rather than a retrieval attempt.
+_GREETING_RE = re.compile(
+    r"^\s*(hi|hello|hey|good\s*(morning|afternoon|evening|day)|howdy|salut|"
+    r"مرحب[اً]?|السلام\s*عليكم|أهلاً?|اهلاً?|هاي|هلو|صباح\s*الخير|مساء\s*الخير)\W*$",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_GREETING_EN = (
+    "Welcome to Mansam — it's a pleasure to have you here! 🌸 "
+    "I'm Layla, your personal fragrance consultant. "
+    "I'd love to help you discover the perfect scent. "
+    "May I ask — are you looking for a fragrance for yourself, or perhaps a gift for someone special?"
+)
+
+_GREETING_AR = (
+    "أهلاً وسهلاً بك في عالم منسم — يسعدنا تواجدك! 🌸 "
+    "أنا ليلى، مستشارتك الشخصية للعطور. "
+    "يسعدني مساعدتك في اكتشاف رائحتك المثالية. "
+    "هل تبحث عن عطر لنفسك، أم أنه هدية لشخص عزيز؟"
+)
+
+_ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+
+
+def _is_greeting(message: str, history: list[dict[str, str]]) -> bool:
+    """Return True when the message is a bare social opener with no prior history."""
+    return bool(not history and _GREETING_RE.match(message.strip()))
+
 
 
 class ChatService:
@@ -87,7 +117,33 @@ class ChatService:
         await db.flush()
         history = await self.memory.get_short_term(conversation.id)
         await self.memory.append_short_term(conversation.id, "user", request.message)
+
+        # ── Phase 1: Greeting fast-path ──────────────────────────────────────
+        # When the very first message is a bare social opener, skip retrieval
+        # entirely and return a warm branded welcome with the first discovery
+        # question. This keeps the first impression instant and human.
+        if _is_greeting(request.message, history):
+            is_arabic = bool(_ARABIC_RE.search(request.message))
+            greeting_text = _GREETING_AR if is_arabic else _GREETING_EN
+            logger.info("greeting_fast_path", request_id=request_id)
+            await self.memory.append_short_term(conversation.id, "assistant", greeting_text)
+            response = await self._persist_answer(
+                db,
+                conversation,
+                request_id,
+                greeting_text,
+                1.0,
+                [],
+                True,
+                "greeting",
+            )
+            await db.commit()
+            await emit("complete")
+            return response
+        # ────────────────────────────────────────────────────────────────────
+
         await emit("understanding")
+
         try:
             plan = await self.planner.plan(request.message, history)
         except LLMUnavailableError:
