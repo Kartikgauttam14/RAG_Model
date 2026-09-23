@@ -68,7 +68,8 @@ class HuggingFaceLLMProvider:
                     model=selected,
                 )
             except LLMUnavailableError as exc:
-                if attempt == 2 or not _retryable(exc.reason):
+                reason: LLMFailureReason = exc.reason
+                if attempt == 2 or not _retryable(reason):
                     raise
                 await asyncio.sleep(0.5 * (2**attempt))
         raise LLMUnavailableError("Hosted language model is unavailable")

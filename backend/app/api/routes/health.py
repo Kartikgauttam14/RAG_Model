@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import asyncio
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Response, status
@@ -32,7 +35,7 @@ async def ready(
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
     settings: Settings = Depends(get_settings),
-) -> dict:
+) -> dict[str, Any]:
     database_ready, redis_ready, vector_store, llm = await asyncio.gather(
         _check_database(db),
         _check_redis(redis),

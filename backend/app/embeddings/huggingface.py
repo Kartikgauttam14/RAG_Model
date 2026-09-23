@@ -68,6 +68,8 @@ class HuggingFaceEmbeddingProvider:
                 raise EmbeddingUnavailableError("Embedding endpoint returned an invalid batch")
             normalized: list[list[float]] = []
             for row in rows:
+                if row is None:
+                    raise EmbeddingUnavailableError("Embedding endpoint returned a null row")
                 vector = [float(value) for value in row]
                 if len(vector) != self.dimension:
                     raise EmbeddingUnavailableError(f"Expected embedding dimension {self.dimension}, got {len(vector)}")
