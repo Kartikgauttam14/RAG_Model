@@ -83,7 +83,11 @@ class HuggingFaceLLMProvider:
         model: str | None = None,
     ) -> LLMResult:
         selected = model or self.settings.hf_model
+        # OpenRouter requires HTTP-Referer and X-Title headers for auth context
         headers = {"Authorization": f"Bearer {self.settings.hf_token}"} if self.settings.hf_token else {}
+        if self.endpoint.startswith("https://openrouter.ai"):
+            headers["HTTP-Referer"] = self.settings.public_base_url or "https://mansam.ai"
+            headers["X-Title"] = self.settings.app_name
         try:
             if self.settings.hf_api_mode == "openai":
                 url = self.endpoint.rstrip("/")
